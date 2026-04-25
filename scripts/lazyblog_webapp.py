@@ -42,6 +42,7 @@ CODEX_RESPONSE_SCHEMA = ROOT_DIR / "schemas" / "lazyblog_codex_response.schema.j
 CODEX_TRANSLATION_SCHEMA = ROOT_DIR / "schemas" / "lazyblog_web_translation.schema.json"
 DEFAULT_MODEL = "gpt-5.4"
 DEFAULT_REASONING = "low"
+DEFAULT_MESSAGE_BATCH_SIZE = 10
 STUDIO_AUTH_COOKIE = "lazyblog_studio_auth"
 STUDIO_AUTH_TTL_SECONDS = 60 * 60 * 24 * 30
 
@@ -381,21 +382,42 @@ class LazyBlogStudio:
         self.save_session(session_id, meta)
         return path
 
+    def message_paths(self, session_id: str) -> list[Path]:
+        return sorted((self.session_dir(session_id) / "messages").glob("*.md"))
+
+    def read_message(self, path: Path) -> dict[str, Any]:
+        text = path.read_text(encoding="utf-8")
+        front_matter, body = split_front_matter(text)
+        return {
+            "id": path.stem,
+            "role": front_matter.get("role") or path.stem.rsplit("-", 1)[-1],
+            "created_at": front_matter.get("created_at", ""),
+            "content": body.strip(),
+            "path": str(path.relative_to(ROOT_DIR)),
+        }
+
     def messages(self, session_id: str) -> list[dict[str, Any]]:
-        rows: list[dict[str, Any]] = []
-        for path in sorted((self.session_dir(session_id) / "messages").glob("*.md")):
-            text = path.read_text(encoding="utf-8")
-            front_matter, body = split_front_matter(text)
-            rows.append(
-                {
-                    "id": path.stem,
-                    "role": front_matter.get("role") or path.stem.rsplit("-", 1)[-1],
-                    "created_at": front_matter.get("created_at", ""),
-                    "content": body.strip(),
-                    "path": str(path.relative_to(ROOT_DIR)),
-                }
-            )
-        return rows
+        return [self.read_message(path) for path in self.message_paths(session_id)]
+
+    def message_page(self, session_id: str, limit: int = DEFAULT_MESSAGE_BATCH_SIZE, before: str = "") -> dict[str, Any]:
+        safe_id = safe_session_id(session_id)
+        limit = max(1, min(int(limit or DEFAULT_MESSAGE_BATCH_SIZE), 50))
+        paths = self.message_paths(safe_id)
+        end = len(paths)
+        if before:
+            end = next((index for index, path in enumerate(paths) if path.stem == before), end)
+        start = max(0, end - limit)
+        rows = [self.read_message(path) for path in paths[start:end]]
+        return {
+            "messages": rows,
+            "message_page": {
+                "limit": limit,
+                "total": len(paths),
+                "loaded_count": len(rows),
+                "has_more": start > 0,
+                "next_before": rows[0]["id"] if rows and start > 0 else "",
+            },
+        }
 
     def transcript(self, session_id: str, limit: int = 24) -> str:
         rows = self.messages(session_id)[-limit:]
@@ -992,10 +1014,9 @@ Rules:
             },
         )
         return {
-            "session": self.load_session(session_id),
+            **self.session_payload(session_id),
             "reply": result,
             "assistant_path": str(assistant_path.relative_to(ROOT_DIR)),
-            "messages": self.messages(session_id),
         }
 
     def draft_folder(self, session_id: str) -> Path:
@@ -1076,8 +1097,7 @@ Rules:
         session["latest_draft"] = str(draft_path.relative_to(ROOT_DIR))
         self.save_session(session_id, session)
         return {
-            "session": self.load_session(session_id),
-            "messages": self.messages(session_id),
+            **self.session_payload(session_id),
             "draft": {
                 "path": str(draft_path.relative_to(ROOT_DIR)),
                 "markdown": draft_path.read_text(encoding="utf-8"),
@@ -1180,8 +1200,7 @@ Rules:
             published.setdefault("warnings", []).append(f"git commit/push failed: {exc}")
             write_json(publish_path, published)
         return {
-            "session": self.load_session(session_id),
-            "messages": self.messages(session_id),
+            **self.session_payload(session_id),
             "draft": {
                 "path": str(draft_path.relative_to(ROOT_DIR)),
                 "markdown": draft_path.read_text(encoding="utf-8"),
@@ -1190,8 +1209,9 @@ Rules:
             "published": published,
         }
 
-    def session_payload(self, session_id: str) -> dict[str, Any]:
+    def session_payload(self, session_id: str, limit: int = DEFAULT_MESSAGE_BATCH_SIZE, before: str = "") -> dict[str, Any]:
         session = self.load_session(safe_session_id(session_id))
+        page = self.message_page(session_id, limit=limit, before=before)
         draft_path = self.latest_draft_path(session_id)
         draft = None
         if draft_path:
@@ -1199,7 +1219,7 @@ Rules:
                 "path": str(draft_path.relative_to(ROOT_DIR)),
                 "markdown": draft_path.read_text(encoding="utf-8"),
             }
-        return {"session": session, "messages": self.messages(session_id), "draft": draft}
+        return {"session": session, "messages": page["messages"], "message_page": page["message_page"], "draft": draft}
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -1240,9 +1260,9 @@ INDEX_HTML = r"""<!doctype html>
       overflow-x: hidden;
     }
     button, input, textarea, select { font: inherit; }
-    .shell { display: grid; grid-template-columns: 260px minmax(0, 1fr) 360px; gap: 18px; width: 100%; max-width: 100vw; min-height: 100vh; padding: 20px; overflow-x: hidden; }
+    .shell { display: grid; grid-template-columns: 260px minmax(0, 1fr) 360px; gap: 18px; width: 100%; max-width: 100vw; height: 100vh; padding: 20px; overflow: hidden; }
     .panel { min-width: 0; background: rgba(255, 250, 240, 0.82); border: 1px solid var(--line); border-radius: 28px; box-shadow: var(--shadow); backdrop-filter: blur(18px); overflow: hidden; }
-    .side, .publish { min-width: 0; padding: 18px; }
+    .side, .publish { min-width: 0; max-height: calc(100vh - 40px); padding: 18px; overflow-y: auto; }
     .brand { padding: 22px; border-bottom: 1px solid var(--line); background: linear-gradient(135deg, rgba(15, 118, 110, 0.12), rgba(217, 107, 67, 0.12)); }
     h1, h2 { font-family: "Fraunces", Georgia, serif; line-height: 1; margin: 0; }
     h1 { font-size: 34px; letter-spacing: -0.05em; }
@@ -1260,7 +1280,7 @@ INDEX_HTML = r"""<!doctype html>
     .session-menu button { width: 100%; padding: 8px 10px; border-radius: 10px; background: transparent; color: var(--ink); text-align: left; }
     .session-menu button:hover { background: rgba(29, 37, 32, 0.08); transform: none; }
     .session-menu .danger { color: #9b2f16; }
-    .chat { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; min-width: 0; max-width: 100%; min-height: calc(100vh - 40px); overflow: hidden; }
+    .chat { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; min-width: 0; max-width: 100%; height: calc(100vh - 40px); overflow: hidden; }
     .chat-head { min-width: 0; padding: 22px 24px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 16px; }
     .chat-head > div:first-child { min-width: 0; }
     #chatTitle, #chatMeta, #modelLabel { overflow: hidden; text-overflow: ellipsis; }
@@ -1268,7 +1288,11 @@ INDEX_HTML = r"""<!doctype html>
     .status { min-width: 0; max-width: 220px; display: inline-flex; gap: 8px; align-items: center; padding: 8px 12px; border-radius: 999px; background: rgba(15, 118, 110, 0.1); color: var(--teal-dark); font-size: 13px; white-space: nowrap; }
     #modelLabel { display: block; min-width: 0; }
     .dot { width: 8px; height: 8px; border-radius: 999px; background: var(--teal); box-shadow: 0 0 0 6px rgba(15, 118, 110, 0.12); }
-    .messages { min-width: 0; min-height: 0; max-width: 100%; padding: 24px; overflow-y: auto; overflow-x: hidden; display: flex; flex-direction: column; gap: 14px; }
+    .messages { min-width: 0; min-height: 0; max-width: 100%; padding: 18px 24px 24px; overflow-y: auto; overflow-x: hidden; display: flex; flex-direction: column; gap: 14px; }
+    .message-list { min-width: 0; display: flex; flex-direction: column; gap: 14px; }
+    .more-messages { display: none; align-self: center; margin: 0 auto 2px; padding: 8px 12px; background: rgba(29, 37, 32, 0.08); color: var(--ink); }
+    .more-messages.visible { display: inline-flex; }
+    .more-messages.loading { cursor: wait; opacity: 0.7; }
     .msg { min-width: 0; max-width: min(760px, 88%); padding: 14px 16px; border-radius: 22px; border: 1px solid var(--line); white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; line-height: 1.48; animation: rise 220ms ease both; }
     .msg.user { align-self: flex-end; background: linear-gradient(135deg, rgba(15, 118, 110, 0.93), rgba(11, 79, 74, 0.93)); color: white; border-color: rgba(15, 118, 110, 0.3); }
     .msg.assistant { align-self: flex-start; background: rgba(255, 255, 255, 0.62); }
@@ -1298,12 +1322,12 @@ INDEX_HTML = r"""<!doctype html>
     .job-status.running, .job-status.queued { background: rgba(227, 169, 47, 0.22); color: #68470e; }
     .job-status.succeeded { background: rgba(15, 118, 110, 0.14); color: var(--teal-dark); }
     .job-status.failed { background: rgba(217, 107, 67, 0.18); color: #7a2f18; }
-    .mobile-menu-toggle, .mobile-publish-toggle { display: none; }
+    .mobile-menu-toggle, .mobile-publish-toggle, .mobile-top-title { display: none; }
     .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
     @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
     @media (max-width: 1080px) { .shell { grid-template-columns: 1fr; } .chat { min-height: 70vh; } .publish { order: 3; } }
     @media (max-width: 720px) {
-      .shell { display: block; min-height: 100svh; padding: 52px 8px 8px; }
+      .shell { display: block; height: 100svh; padding: 52px 8px 8px; overflow: hidden; }
       .mobile-menu-toggle {
         position: fixed;
         top: 10px;
@@ -1323,6 +1347,27 @@ INDEX_HTML = r"""<!doctype html>
         box-shadow: 0 12px 30px rgba(28, 45, 38, 0.12);
       }
       .mobile-menu-toggle span { width: 18px; height: 2px; border-radius: 999px; background: currentColor; }
+      .mobile-top-title {
+        position: fixed;
+        top: 10px;
+        left: 60px;
+        right: 10px;
+        z-index: 39;
+        display: flex;
+        align-items: center;
+        height: 38px;
+        padding: 0 14px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: rgba(255, 250, 240, 0.86);
+        box-shadow: 0 12px 30px rgba(28, 45, 38, 0.1);
+        font-family: "Fraunces", Georgia, serif;
+        font-size: 18px;
+        letter-spacing: -0.04em;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
       .side {
         display: none;
         margin-bottom: 8px;
@@ -1340,7 +1385,8 @@ INDEX_HTML = r"""<!doctype html>
       .session { padding: 9px 10px; border-radius: 14px; }
       .session strong { font-size: 14px; }
       .chat {
-        min-height: calc(100svh - 60px);
+        height: calc(100svh - 60px);
+        min-height: 0;
         grid-template-rows: auto minmax(0, 1fr) auto;
         border-radius: 22px;
       }
@@ -1348,13 +1394,12 @@ INDEX_HTML = r"""<!doctype html>
       .chat-head .sub { margin-top: 4px; font-size: 12px; max-width: 100%; }
       .status { flex: 0 1 118px; max-width: 118px; gap: 6px; padding: 6px 8px; font-size: 12px; }
       .dot { width: 7px; height: 7px; box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.12); }
-      .messages { padding: 10px; gap: 8px; }
+      .messages { padding: 8px 10px 10px; gap: 8px; }
+      .message-list { gap: 8px; }
+      .more-messages { padding: 7px 11px; font-size: 13px; }
       .msg { max-width: 96%; padding: 10px 11px; border-radius: 16px; line-height: 1.38; }
       .msg.user { max-width: 94%; }
       .composer {
-        position: sticky;
-        bottom: 0;
-        z-index: 30;
         padding: 8px;
         background: rgba(255, 244, 217, 0.88);
       }
@@ -1397,6 +1442,12 @@ INDEX_HTML = r"""<!doctype html>
       .log { padding: 10px; font-size: 12px; }
       .monitor-head { margin-top: 14px; }
     }
+    @supports not (height: 100svh) {
+      @media (max-width: 720px) {
+        .shell { height: 100vh; }
+        .chat { height: calc(100vh - 60px); }
+      }
+    }
   </style>
 </head>
 <body>
@@ -1404,6 +1455,7 @@ INDEX_HTML = r"""<!doctype html>
     <button id="mobileMenuToggle" class="mobile-menu-toggle" type="button" aria-label="Toggle chat history" aria-expanded="false">
       <span></span><span></span><span></span>
     </button>
+    <div class="mobile-top-title">LazyBlog Studio</div>
     <aside class="panel side">
       <div class="brand">
         <h1>LazyBlog Studio</h1>
@@ -1423,7 +1475,10 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <div class="status"><span class="dot"></span><span id="modelLabel">Codex ready</span></div>
       </header>
-      <div id="messages" class="messages"></div>
+      <div id="messages" class="messages">
+        <button id="moreMessages" class="more-messages" type="button">More messages</button>
+        <div id="messageList" class="message-list"></div>
+      </div>
       <form id="composer" class="composer">
         <textarea id="messageInput" placeholder="Write a note, idea, outline, memory, or instruction. The reply tool will store it and respond; the task tool can turn the session into a post."></textarea>
         <div class="row">
@@ -1467,7 +1522,7 @@ INDEX_HTML = r"""<!doctype html>
     </aside>
   </main>
   <script>
-    const state = { sessionId: null, busy: false };
+    const state = { sessionId: null, busy: false, messagePage: null, loadingMore: false };
     const $ = (id) => document.getElementById(id);
     const shell = $("shell");
     $("modelLabel").textContent = "__MODEL_LABEL__";
@@ -1506,11 +1561,23 @@ INDEX_HTML = r"""<!doctype html>
 
     function clearChat() {
       state.sessionId = null;
+      state.messagePage = null;
       $("chatTitle").textContent = "New chat";
       $("chatMeta").textContent = "Messages will be saved as Markdown.";
-      $("messages").innerHTML = "";
+      $("messageList").innerHTML = "";
+      $("messages").scrollTop = 0;
+      updateMoreButton();
       $("draftPreview").value = "";
       $("publishLog").textContent = "No draft yet.";
+    }
+
+    function updateMoreButton() {
+      const page = state.messagePage || {};
+      const button = $("moreMessages");
+      button.classList.toggle("visible", Boolean(page.has_more));
+      button.classList.toggle("loading", state.loadingMore);
+      button.textContent = state.loadingMore ? "Loading..." : "More messages";
+      button.disabled = state.loadingMore || !page.has_more;
     }
 
     function renderSessions(sessions) {
@@ -1590,7 +1657,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function renderMessages(messages) {
-      const root = $("messages");
+      const root = $("messageList");
       root.innerHTML = "";
       for (const msg of messages || []) {
         const el = document.createElement("div");
@@ -1598,14 +1665,30 @@ INDEX_HTML = r"""<!doctype html>
         el.textContent = msg.content;
         root.appendChild(el);
       }
-      root.scrollTop = root.scrollHeight;
+      $("messages").scrollTop = $("messages").scrollHeight;
+    }
+
+    function prependMessages(messages) {
+      if (!messages || messages.length === 0) return;
+      const scroller = $("messages");
+      const list = $("messageList");
+      const previousHeight = scroller.scrollHeight;
+      for (const msg of [...messages].reverse()) {
+        const el = document.createElement("div");
+        el.className = `msg ${msg.role}`;
+        el.textContent = msg.content;
+        list.prepend(el);
+      }
+      scroller.scrollTop += scroller.scrollHeight - previousHeight;
     }
 
     function renderSession(payload) {
       state.sessionId = payload.session.id;
+      state.messagePage = payload.message_page || null;
       $("chatTitle").textContent = payload.session.title || payload.session.id;
       $("chatMeta").textContent = `${payload.session.message_count || 0} messages stored in content/chat/${payload.session.id}`;
       renderMessages(payload.messages || []);
+      updateMoreButton();
       if (payload.draft) {
         $("draftPreview").value = payload.draft.markdown || "";
         $("publishLog").innerHTML = `Latest draft: <span class="path">${escapeHtml(payload.draft.path)}</span>`;
@@ -1630,8 +1713,25 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     async function loadSession(id) {
-      const data = await api(`/api/session?id=${encodeURIComponent(id)}`);
+      const data = await api(`/api/session?id=${encodeURIComponent(id)}&limit=10`);
       renderSession(data);
+    }
+
+    async function loadMoreMessages() {
+      const page = state.messagePage || {};
+      if (!state.sessionId || !page.has_more || state.loadingMore) return;
+      state.loadingMore = true;
+      updateMoreButton();
+      try {
+        const data = await api(`/api/messages?session_id=${encodeURIComponent(state.sessionId)}&limit=10&before=${encodeURIComponent(page.next_before || "")}`);
+        prependMessages(data.messages || []);
+        state.messagePage = data.message_page || null;
+      } catch (err) {
+        $("publishLog").textContent = err.message;
+      } finally {
+        state.loadingMore = false;
+        updateMoreButton();
+      }
     }
 
     async function renameSession(id, currentTitle) {
@@ -1726,6 +1826,20 @@ INDEX_HTML = r"""<!doctype html>
 
     $("composer").addEventListener("submit", sendMessage);
     $("draftButton").addEventListener("click", draftPost);
+    $("moreMessages").addEventListener("click", loadMoreMessages);
+    $("messages").addEventListener("scroll", () => {
+      const button = $("moreMessages");
+      const scroller = $("messages");
+      const buttonRect = button.getBoundingClientRect();
+      const scrollerRect = scroller.getBoundingClientRect();
+      if (
+        button.classList.contains("visible") &&
+        buttonRect.top <= scrollerRect.top + 24 &&
+        buttonRect.bottom >= scrollerRect.top
+      ) {
+        loadMoreMessages();
+      }
+    }, { passive: true });
     $("publishButton").addEventListener("click", () => publishPost(false));
     $("redraftButton").addEventListener("click", () => publishPost(true));
     $("refreshSessions").addEventListener("click", loadSessions);
@@ -2131,7 +2245,16 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
                 if parsed.path == "/api/session":
                     params = urllib.parse.parse_qs(parsed.query)
                     session_id = params.get("id", [""])[0]
-                    self.send_json(app.session_payload(session_id))
+                    raw_limit = params.get("limit", [str(DEFAULT_MESSAGE_BATCH_SIZE)])[0]
+                    before = params.get("before", [""])[0]
+                    self.send_json(app.session_payload(session_id, limit=int(raw_limit), before=before))
+                    return
+                if parsed.path == "/api/messages":
+                    params = urllib.parse.parse_qs(parsed.query)
+                    session_id = params.get("session_id", [""])[0]
+                    raw_limit = params.get("limit", [str(DEFAULT_MESSAGE_BATCH_SIZE)])[0]
+                    before = params.get("before", [""])[0]
+                    self.send_json(app.message_page(session_id, limit=int(raw_limit), before=before))
                     return
                 if parsed.path == "/api/codex/jobs":
                     params = urllib.parse.parse_qs(parsed.query)
