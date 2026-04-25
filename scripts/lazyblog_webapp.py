@@ -1474,11 +1474,17 @@ INDEX_HTML = r"""<!doctype html>
       .shell.publish-open .mobile-publish-toggle .triangle { transform: rotate(180deg); }
       .publish {
         display: none;
-        margin-top: 8px;
+        position: fixed;
+        left: 8px;
+        right: 8px;
+        bottom: 8px;
+        z-index: 46;
+        margin-top: 0;
         padding: 12px;
         border-radius: 22px;
-        max-height: 58vh;
+        max-height: min(70svh, calc(100svh - 74px));
         overflow-y: auto;
+        box-shadow: 0 22px 60px rgba(22, 30, 25, 0.28);
       }
       .shell.publish-open .publish { display: block; }
       .field { margin-top: 10px; }
