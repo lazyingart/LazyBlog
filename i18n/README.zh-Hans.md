@@ -4,14 +4,11 @@
 
 # LazyBlog
 
-LazyBlog 是 LazyingArt 的公开、已脱敏博客工具库，用来把 Markdown、
+LazyBlog 是 LazyingArt 的 Markdown-first 博客工具库，用来把 Markdown、
 图片、分类、语言元数据和译文同步到 WordPress。
 
 [![Live Blog](https://img.shields.io/badge/Live-blog.lazying.art-111827?style=for-the-badge&logo=googlechrome&logoColor=white)](https://blog.lazying.art)
 [![WordPress](https://img.shields.io/badge/WordPress-translation%20plugin-21759B?style=for-the-badge&logo=wordpress&logoColor=white)](../wordpress-plugins/lazyblog-translations)
-
-这个公开仓库只保留可复用工具，不包含私有文章归档、聊天记录、服务器
-IP、SSH 配置、应用密码或生产运维历史。
 
 ## 核心能力
 
@@ -24,7 +21,7 @@ IP、SSH 配置、应用密码或生产运维历史。
 ## 快速开始
 
 ```bash
-git clone https://github.com/lazyingart/LazyBlog.git
+git clone --recurse-submodules https://github.com/lazyingart/LazyBlog.git
 cd LazyBlog
 cp .env.example .env
 $EDITOR .env
@@ -41,10 +38,15 @@ $EDITOR .env
   --status draft
 ```
 
-## 公开边界
+## 插件子模块
 
-不要提交 `.env`、`content/posts/`、`content/chat/`、SSH 信息、服务器 IP、
-WordPress Application Password、API key 或私有 prompt 日志。
+`wordpress-plugins/lazyblog-translations/` 是指向
+https://github.com/lazyingart/lazyblog-translations 的 Git submodule。
+如果已经 clone 过仓库但没有拉取 submodule，请运行：
+
+```bash
+git submodule update --init --recursive
+```
 
 ## 支持
 

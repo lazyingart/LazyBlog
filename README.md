@@ -35,11 +35,17 @@ language metadata, and reviewed translations.
 ## Quick Start
 
 ```bash
-git clone https://github.com/lazyingart/LazyBlog.git
+git clone --recurse-submodules https://github.com/lazyingart/LazyBlog.git
 cd LazyBlog
 cp .env.example .env
 $EDITOR .env
 python3 -m py_compile scripts/*.py
+```
+
+If you already cloned without submodules:
+
+```bash
+git submodule update --init --recursive
 ```
 
 Publish a draft from any project:
@@ -77,6 +83,10 @@ LazyBlog Translations is included in:
 ```text
 wordpress-plugins/lazyblog-translations/
 ```
+
+That path is a Git submodule pointing to
+https://github.com/lazyingart/lazyblog-translations, so clicking it on GitHub
+opens the standalone plugin repository.
 
 It stores translations as post meta, renders a small language switcher, and can
 request a missing translation from one of three providers:

@@ -1,0 +1,3 @@
+[submodule "wordpress-plugins/lazyblog-translations"]
+	path = wordpress-plugins/lazyblog-translations
+	url = https://github.com/lazyingart/lazyblog-translations.git
