@@ -341,8 +341,14 @@ function lazyblog_decode_terms(array $terms): array
     return array_values(array_unique($decoded));
 }
 
+function lazyblog_decode_term_name(string $name): string
+{
+    return trim(html_entity_decode($name, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+}
+
 function lazyblog_term_id(string $taxonomy, string $name): int
 {
+    $name = lazyblog_decode_term_name($name);
     $existing = term_exists($name, $taxonomy);
     if (is_array($existing) && isset($existing['term_id'])) {
         return (int) $existing['term_id'];
@@ -357,6 +363,162 @@ function lazyblog_term_id(string $taxonomy, string $name): int
     }
 
     return (int) $created['term_id'];
+}
+
+function lazyblog_category_id(string $name, string $slug = ''): int
+{
+    $name = lazyblog_decode_term_name($name);
+    $slug = trim($slug);
+
+    if ($slug !== '') {
+        $existing = get_term_by('slug', $slug, 'category');
+        if ($existing instanceof WP_Term) {
+            return (int) $existing->term_id;
+        }
+    }
+
+    $existing = term_exists($name, 'category');
+    if (is_array($existing) && isset($existing['term_id'])) {
+        return (int) $existing['term_id'];
+    }
+    if (is_int($existing)) {
+        return $existing;
+    }
+
+    $args = [];
+    if ($slug !== '') {
+        $args['slug'] = $slug;
+    }
+    $created = wp_insert_term($name, 'category', $args);
+    if (is_wp_error($created)) {
+        throw new RuntimeException($created->get_error_message());
+    }
+
+    return (int) $created['term_id'];
+}
+
+function lazyblog_category_snapshot_path(string $content_root): string
+{
+    return dirname(rtrim($content_root, '/')) . '/taxonomy/categories.json';
+}
+
+function lazyblog_upsert_snapshot_category(array $category, int $parent_id): int
+{
+    $name = lazyblog_decode_term_name((string) ($category['name'] ?? ''));
+    if ($name === '') {
+        throw new RuntimeException('Category snapshot contains an empty category name.');
+    }
+
+    $slug = trim((string) ($category['slug'] ?? ''));
+    $description = (string) ($category['description'] ?? '');
+    $term = $slug !== '' ? get_term_by('slug', $slug, 'category') : false;
+
+    if (!$term instanceof WP_Term) {
+        $args = [
+            'description' => $description,
+            'parent' => $parent_id,
+        ];
+        if ($slug !== '') {
+            $args['slug'] = $slug;
+        }
+
+        $created = wp_insert_term($name, 'category', $args);
+        if (is_wp_error($created)) {
+            if ($slug !== '') {
+                throw new RuntimeException($created->get_error_message());
+            }
+            $existing = term_exists($name, 'category');
+            if (is_array($existing) && isset($existing['term_id'])) {
+                $term_id = (int) $existing['term_id'];
+            } elseif (is_int($existing)) {
+                $term_id = $existing;
+            } else {
+                throw new RuntimeException($created->get_error_message());
+            }
+        } else {
+            $term_id = (int) $created['term_id'];
+        }
+    } else {
+        $term_id = (int) $term->term_id;
+    }
+
+    $update = [
+        'name' => $name,
+        'description' => $description,
+        'parent' => $parent_id,
+    ];
+    if ($slug !== '') {
+        $update['slug'] = $slug;
+    }
+
+    $updated = wp_update_term($term_id, 'category', $update);
+    if (is_wp_error($updated)) {
+        throw new RuntimeException($updated->get_error_message());
+    }
+
+    return $term_id;
+}
+
+function lazyblog_sync_category_snapshot(string $content_root): array
+{
+    $path = lazyblog_category_snapshot_path($content_root);
+    if (!is_file($path)) {
+        return [
+            'path' => $path,
+            'found' => false,
+            'categories' => 0,
+        ];
+    }
+
+    $payload = json_decode((string) file_get_contents($path), true);
+    if (!is_array($payload) || !is_array($payload['categories'] ?? null)) {
+        throw new RuntimeException("Invalid category snapshot: {$path}");
+    }
+
+    $pending = array_values($payload['categories']);
+    $local_by_live_id = [];
+    $created_or_updated = 0;
+
+    while ($pending !== []) {
+        $next = [];
+        $progress = false;
+        foreach ($pending as $category) {
+            $live_id = (int) ($category['term_id'] ?? 0);
+            $live_parent = (int) ($category['parent'] ?? 0);
+            if ($live_parent > 0 && !isset($local_by_live_id[$live_parent])) {
+                $next[] = $category;
+                continue;
+            }
+
+            $parent_id = $live_parent > 0 ? (int) $local_by_live_id[$live_parent] : 0;
+            $local_id = lazyblog_upsert_snapshot_category($category, $parent_id);
+            if ($live_id > 0) {
+                $local_by_live_id[$live_id] = $local_id;
+            }
+            $created_or_updated++;
+            $progress = true;
+        }
+
+        if (!$progress) {
+            foreach ($next as $category) {
+                $live_id = (int) ($category['term_id'] ?? 0);
+                $local_id = lazyblog_upsert_snapshot_category($category, 0);
+                if ($live_id > 0) {
+                    $local_by_live_id[$live_id] = $local_id;
+                }
+                $created_or_updated++;
+            }
+            break;
+        }
+
+        $pending = $next;
+    }
+
+    return [
+        'path' => $path,
+        'found' => true,
+        'categories' => $created_or_updated,
+    ];
 }
 
 function lazyblog_clear_local_content(): array
@@ -449,11 +611,12 @@ function lazyblog_import_post(string $post_dir, string $status_override): array
     $body = lazyblog_rewrite_local_image_paths($body, $media_urls);
     $source_language = (string) ($manifest['source_language'] ?? lazyblog_front_value($front_matter, 'source_language', 'en'));
     $categories = lazyblog_decode_terms(is_array($manifest['categories'] ?? null) ? $manifest['categories'] : ($front_matter['categories'] ?? []));
+    $category_slugs = is_array($manifest['category_slugs'] ?? null) ? array_values($manifest['category_slugs']) : [];
     $tags = lazyblog_decode_terms(is_array($manifest['tags'] ?? null) ? $manifest['tags'] : ($front_matter['tags'] ?? []));
     $category_ids = [];
 
-    foreach ($categories as $category_name) {
-        $category_ids[] = lazyblog_term_id('category', $category_name);
+    foreach ($categories as $index => $category_name) {
+        $category_ids[] = lazyblog_category_id($category_name, (string) ($category_slugs[$index] ?? ''));
     }
     if ($category_ids === []) {
         $category_ids[] = (int) get_option('default_category');
@@ -539,6 +702,10 @@ if (!is_plugin_active($plugin)) {
 
 lazyblog_log('Clearing local Docker posts, attachments, tags, and non-default categories.');
 $deleted = lazyblog_clear_local_content();
+$category_snapshot = lazyblog_sync_category_snapshot($content_root);
+if ($category_snapshot['found']) {
+    lazyblog_log(sprintf('Synced %d categories from %s.', $category_snapshot['categories'], $category_snapshot['path']));
+}
 
 $post_dirs = glob(rtrim($content_root, '/') . '/*', GLOB_ONLYDIR) ?: [];
 usort($post_dirs, static fn($a, $b) => (int) basename($a) <=> (int) basename($b));
@@ -547,6 +714,7 @@ $summary = [
     'content_root' => $content_root,
     'status' => $status_override,
     'deleted' => $deleted,
+    'category_snapshot' => $category_snapshot,
     'posts' => 0,
     'translations' => 0,
     'media_files' => 0,

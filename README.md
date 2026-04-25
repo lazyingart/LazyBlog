@@ -27,6 +27,7 @@ language metadata, and reviewed translations.
 | Markdown publishing | `lazypub`, `scripts/lazypub.py` | Publish a Markdown file from any repo into WordPress |
 | Sync engine | `scripts/lazyblog_sync.py` | Maintain post source Markdown, media migration, and translations |
 | Translation helper | `scripts/lazyblog_translate.py` | Scaffold and push post translations |
+| Category sync | `scripts/sync_live_categories.py` | Pull WordPress category terms and post assignments into local metadata |
 | Studio API | `scripts/lazyblog_webapp.py` | Local PWA/API for chat-to-draft and on-demand translation jobs |
 | WordPress plugin | `wordpress-plugins/lazyblog-translations/` | Store/render translations and request missing ones asynchronously |
 | Local test site | `docker-compose.yml`, `scripts/setup_local_wordpress.sh` | Run a disposable WordPress test site with the plugin mounted |
@@ -74,6 +75,14 @@ Generate first-pass translations with Codex:
   --upload-media \
   --remove-dead-images \
   --status draft
+```
+
+Mirror live category names/slugs before refreshing the Docker test site:
+
+```bash
+python3 scripts/sync_live_categories.py --dry-run
+python3 scripts/sync_live_categories.py
+./scripts/publish_local_wordpress.sh
 ```
 
 ## WordPress Plugin
