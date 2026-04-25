@@ -1316,11 +1316,16 @@ INDEX_HTML = r"""<!doctype html>
     .session strong { display: block; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .session span { display: block; color: var(--muted); font-size: 12px; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .session-more { width: 30px; height: 30px; padding: 0; border-radius: 999px; background: rgba(29, 37, 32, 0.06); color: var(--ink); font-size: 18px; line-height: 1; }
-    .session-menu { position: absolute; right: 10px; top: 42px; z-index: 20; display: none; min-width: 128px; padding: 6px; border: 1px solid var(--line); border-radius: 14px; background: rgba(255, 250, 240, 0.96); box-shadow: 0 18px 40px rgba(28, 45, 38, 0.16); }
-    .session.menu-open .session-menu { display: grid; gap: 4px; }
-    .session-menu button { width: 100%; padding: 8px 10px; border-radius: 10px; background: transparent; color: var(--ink); text-align: left; }
-    .session-menu button:hover { background: rgba(29, 37, 32, 0.08); transform: none; }
-    .session-menu .danger { color: #9b2f16; }
+    .modal-backdrop { position: fixed; inset: 0; z-index: 1000; display: none; place-items: center; padding: 18px; background: rgba(22, 30, 25, 0.34); backdrop-filter: blur(8px); }
+    .modal-backdrop.open { display: grid; }
+    .session-modal { width: min(360px, 100%); border: 1px solid rgba(39, 55, 46, 0.18); border-radius: 26px; padding: 18px; background: rgba(255, 250, 240, 0.96); box-shadow: 0 30px 80px rgba(22, 30, 25, 0.28); }
+    .session-modal h2 { font-size: 23px; }
+    .session-modal-title { margin: 8px 0 16px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .modal-actions { display: grid; gap: 8px; }
+    .modal-actions button { width: 100%; border-radius: 16px; padding: 11px 13px; text-align: left; background: rgba(29, 37, 32, 0.07); color: var(--ink); }
+    .modal-actions button:hover { background: rgba(29, 37, 32, 0.12); transform: none; }
+    .modal-actions .danger { color: #9b2f16; background: rgba(217, 107, 67, 0.13); }
+    .modal-actions .cancel { text-align: center; background: transparent; color: var(--muted); }
     .chat { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; min-width: 0; max-width: 100%; height: calc(100vh - 40px); overflow: hidden; }
     .chat-head { min-width: 0; padding: 22px 24px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 16px; }
     .chat-head > div:first-child { min-width: 0; }
@@ -1562,8 +1567,20 @@ INDEX_HTML = r"""<!doctype html>
       <div id="jobs" class="job-list"></div>
     </aside>
   </main>
+  <div id="sessionActionModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="sessionActionTitle">
+    <div class="session-modal">
+      <h2 id="sessionActionTitle">Chat actions</h2>
+      <p id="sessionActionName" class="session-modal-title"></p>
+      <div class="modal-actions">
+        <button id="modalRename" type="button">Rename</button>
+        <button id="modalAutoRename" type="button">Auto rename</button>
+        <button id="modalDelete" class="danger" type="button">Delete</button>
+        <button id="modalCancel" class="cancel" type="button">Cancel</button>
+      </div>
+    </div>
+  </div>
   <script>
-    const state = { sessionId: null, busy: false, messagePage: null, loadingMore: false };
+    const state = { sessionId: null, busy: false, messagePage: null, loadingMore: false, modalSession: null };
     const $ = (id) => document.getElementById(id);
     const shell = $("shell");
     $("modelLabel").textContent = "__MODEL_LABEL__";
@@ -1596,8 +1613,14 @@ INDEX_HTML = r"""<!doctype html>
       }[ch]));
     }
 
-    function closeSessionMenus() {
-      document.querySelectorAll(".session.menu-open").forEach((el) => el.classList.remove("menu-open"));
+    function openSessionModal(session) {
+      state.modalSession = session;
+      $("sessionActionName").textContent = session.title || session.id;
+      $("sessionActionModal").classList.add("open");
+    }
+
+    function closeSessionModal() {
+      $("sessionActionModal").classList.remove("open");
     }
 
     function clearChat() {
@@ -1634,39 +1657,15 @@ INDEX_HTML = r"""<!doctype html>
             <span>${escapeHtml(item.updated_at || "")}</span>
           </div>
           <button class="session-more" type="button" aria-label="Chat actions" aria-expanded="false">&#8943;</button>
-          <div class="session-menu">
-            <button type="button" data-action="rename">Rename</button>
-            <button type="button" data-action="auto-rename">Auto rename</button>
-            <button type="button" class="danger" data-action="delete">Delete</button>
-          </div>
         `;
         el.addEventListener("click", () => {
-          closeSessionMenus();
           loadSession(item.id);
           shell.classList.remove("nav-open");
           $("mobileMenuToggle").setAttribute("aria-expanded", "false");
         });
         el.querySelector(".session-more").addEventListener("click", (event) => {
           event.stopPropagation();
-          const wasOpen = el.classList.contains("menu-open");
-          closeSessionMenus();
-          el.classList.toggle("menu-open", !wasOpen);
-          el.querySelector(".session-more").setAttribute("aria-expanded", String(!wasOpen));
-        });
-        el.querySelector('[data-action="rename"]').addEventListener("click", (event) => {
-          event.stopPropagation();
-          closeSessionMenus();
-          renameSession(item.id, title);
-        });
-        el.querySelector('[data-action="auto-rename"]').addEventListener("click", (event) => {
-          event.stopPropagation();
-          closeSessionMenus();
-          autoRenameSession(item.id);
-        });
-        el.querySelector('[data-action="delete"]').addEventListener("click", (event) => {
-          event.stopPropagation();
-          closeSessionMenus();
-          deleteSession(item.id, title);
+          openSessionModal({ id: item.id, title });
         });
         root.appendChild(el);
       }
@@ -1911,13 +1910,34 @@ INDEX_HTML = r"""<!doctype html>
       const opened = shell.classList.toggle("publish-open");
       $("publishToggle").setAttribute("aria-expanded", String(opened));
     });
+    $("modalRename").addEventListener("click", () => {
+      const session = state.modalSession;
+      closeSessionModal();
+      if (session) renameSession(session.id, session.title);
+    });
+    $("modalAutoRename").addEventListener("click", () => {
+      const session = state.modalSession;
+      closeSessionModal();
+      if (session) autoRenameSession(session.id);
+    });
+    $("modalDelete").addEventListener("click", () => {
+      const session = state.modalSession;
+      closeSessionModal();
+      if (session) deleteSession(session.id, session.title);
+    });
+    $("modalCancel").addEventListener("click", closeSessionModal);
+    $("sessionActionModal").addEventListener("click", (event) => {
+      if (event.target === $("sessionActionModal")) closeSessionModal();
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") closeSessionModal();
+    });
     $("newSession").addEventListener("click", () => {
       shell.classList.remove("nav-open");
       $("mobileMenuToggle").setAttribute("aria-expanded", "false");
       clearChat();
       loadSessions();
     });
-    document.addEventListener("click", closeSessionMenus);
     if ("serviceWorker" in navigator) {
       window.addEventListener("load", () => {
         navigator.serviceWorker.register("/service-worker.js").catch(() => {});
