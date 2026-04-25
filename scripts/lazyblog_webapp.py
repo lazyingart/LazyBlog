@@ -1316,9 +1316,9 @@ INDEX_HTML = r"""<!doctype html>
     .session strong { display: block; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .session span { display: block; color: var(--muted); font-size: 12px; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .session-more { width: 30px; height: 30px; padding: 0; border-radius: 999px; background: rgba(29, 37, 32, 0.06); color: var(--ink); font-size: 18px; line-height: 1; }
-    .modal-backdrop { position: fixed; inset: 0; z-index: 1000; display: none; place-items: center; padding: 18px; background: rgba(22, 30, 25, 0.34); backdrop-filter: blur(8px); }
-    .modal-backdrop.open { display: grid; }
-    .session-modal { width: min(360px, 100%); border: 1px solid rgba(39, 55, 46, 0.18); border-radius: 26px; padding: 18px; background: rgba(255, 250, 240, 0.96); box-shadow: 0 30px 80px rgba(22, 30, 25, 0.28); }
+    .modal-backdrop { position: fixed; inset: 0; z-index: 1000; display: none; background: rgba(22, 30, 25, 0.34); backdrop-filter: blur(8px); overflow: hidden; }
+    .modal-backdrop.open { display: block; }
+    .session-modal { position: fixed; top: 50%; left: 50%; width: min(360px, calc(100vw - 32px)); max-width: calc(100vw - 32px); max-height: calc(100vh - 32px); overflow-y: auto; transform: translate(-50%, -50%); border: 1px solid rgba(39, 55, 46, 0.18); border-radius: 26px; padding: 18px; background: rgba(255, 250, 240, 0.96); box-shadow: 0 30px 80px rgba(22, 30, 25, 0.28); }
     .session-modal h2 { font-size: 23px; }
     .session-modal-title { margin: 8px 0 16px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .modal-actions { display: grid; gap: 8px; }

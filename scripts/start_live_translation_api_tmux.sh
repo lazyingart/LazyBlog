@@ -25,6 +25,7 @@ DEFAULT_REASONING="${LAZYBLOG_WEBAPP_REASONING:-low}"
 CODEX_BIN_DIR="${LAZYBLOG_CODEX_BIN_DIR:-$HOME/.local/codex-cli/node_modules/.bin}"
 NGROK_URL="${LAZYBLOG_NGROK_URL:-}"
 NGROK_BIN="${LAZYBLOG_NGROK_BIN:-$(command -v ngrok || echo ngrok)}"
+NGROK_POOLING="${LAZYBLOG_NGROK_POOLING:-0}"
 
 if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
   echo "Tmux session '$SESSION_NAME' already exists."
@@ -75,7 +76,11 @@ if ! command -v "$NGROK_BIN" >/dev/null 2>&1; then
   echo "Requested tunnel: ngrok http --url=\${LAZYBLOG_NGROK_URL:-$NGROK_URL} \${LAZYBLOG_WEBAPP_PORT:-$DEFAULT_PORT}"
   exec bash
 fi
-"$NGROK_BIN" http --url="\${LAZYBLOG_NGROK_URL:-$NGROK_URL}" "\${LAZYBLOG_WEBAPP_PORT:-$DEFAULT_PORT}"
+NGROK_POOLING_FLAG=""
+if [ "\${LAZYBLOG_NGROK_POOLING:-$NGROK_POOLING}" = "1" ] || [ "\${LAZYBLOG_NGROK_POOLING:-$NGROK_POOLING}" = "true" ]; then
+  NGROK_POOLING_FLAG="--pooling-enabled"
+fi
+"$NGROK_BIN" http --url="\${LAZYBLOG_NGROK_URL:-$NGROK_URL}" \$NGROK_POOLING_FLAG "\${LAZYBLOG_WEBAPP_PORT:-$DEFAULT_PORT}"
 status=\$?
 echo "ngrok exited with status \$status. Fix the issue above, then rerun the same command from this pane."
 exec bash
