@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "reply",
+    "action",
+    "draft",
+    "storage_plan",
+    "research_queries",
+    "research_sources",
+    "local_matches_used",
+    "needs_review",
+    "notes"
+  ],
+  "properties": {
+    "reply": {
+      "type": "string",
+      "minLength": 1
+    },
+    "action": {
+      "type": "string",
+      "enum": ["draft_post", "revise_draft", "research_needed", "no_publishable_draft"]
+    },
+    "draft": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "title",
+        "slug",
+        "source_language",
+        "excerpt",
+        "markdown",
+        "categories",
+        "tags",
+        "status"
+      ],
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "slug": {
+          "type": "string"
+        },
+        "source_language": {
+          "type": "string",
+          "enum": ["en", "ja", "zh"]
+        },
+        "excerpt": {
+          "type": "string"
+        },
+        "markdown": {
+          "type": "string",
+          "minLength": 1
+        },
+        "categories": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "status": {
+          "type": "string",
+          "enum": ["draft", "publish", "private"]
+        }
+      }
+    },
+    "storage_plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["folder", "files"],
+      "properties": {
+        "folder": {
+          "type": "string"
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "research_queries": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "research_sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["title", "url", "note"],
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "local_matches_used": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "needs_review": {
+      "type": "boolean"
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

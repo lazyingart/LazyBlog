@@ -1,0 +1,10 @@
+.env
+.env.local
+content/
+out/
+tmp/
+logs/
+*.log
+__pycache__/
+*.py[cod]
+.DS_Store

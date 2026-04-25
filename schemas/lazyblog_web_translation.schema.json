@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["language", "title", "content", "excerpt", "notes"],
+  "properties": {
+    "language": {
+      "type": "string",
+      "minLength": 1
+    },
+    "title": {
+      "type": "string"
+    },
+    "content": {
+      "type": "string"
+    },
+    "excerpt": {
+      "type": "string"
+    },
+    "notes": {
+      "type": "string"
+    }
+  }
+}

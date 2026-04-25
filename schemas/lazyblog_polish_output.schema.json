@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["source_language", "classification", "markdown", "notes"],
+  "properties": {
+    "source_language": {
+      "type": "string",
+      "enum": ["en", "ja", "zh"]
+    },
+    "classification": {
+      "type": "string",
+      "enum": ["technical", "literary"]
+    },
+    "markdown": {
+      "type": "string",
+      "minLength": 1
+    },
+    "notes": {
+      "type": "string"
+    }
+  }
+}

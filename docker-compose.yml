@@ -1,0 +1,59 @@
+services:
+  db:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: lazyblog
+      MYSQL_USER: lazyblog
+      MYSQL_PASSWORD: lazyblog
+      MYSQL_ROOT_PASSWORD: lazyblog-root
+    volumes:
+      - lazyblog_db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-ulazyblog", "-plazyblog"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  wordpress:
+    image: wordpress:6.8-php8.2-apache
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8088:80"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      WORDPRESS_DB_HOST: db:3306
+      WORDPRESS_DB_NAME: lazyblog
+      WORDPRESS_DB_USER: lazyblog
+      WORDPRESS_DB_PASSWORD: lazyblog
+      WORDPRESS_CONFIG_EXTRA: |
+        define('WP_DEBUG', true);
+        define('WP_DEBUG_LOG', true);
+        define('WP_ENVIRONMENT_TYPE', 'local');
+    volumes:
+      - lazyblog_wordpress:/var/www/html
+      - ./wordpress-plugins/lazyblog-translations:/var/www/html/wp-content/plugins/lazyblog-translations
+
+  wpcli:
+    image: wordpress:cli-php8.2
+    depends_on:
+      wordpress:
+        condition: service_started
+    user: "33:33"
+    environment:
+      WORDPRESS_DB_HOST: db:3306
+      WORDPRESS_DB_NAME: lazyblog
+      WORDPRESS_DB_USER: lazyblog
+      WORDPRESS_DB_PASSWORD: lazyblog
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - lazyblog_wordpress:/var/www/html
+      - ./wordpress-plugins/lazyblog-translations:/var/www/html/wp-content/plugins/lazyblog-translations
+    working_dir: /var/www/html
+
+volumes:
+  lazyblog_db:
+  lazyblog_wordpress:
