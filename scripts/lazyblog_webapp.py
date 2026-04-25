@@ -352,6 +352,47 @@ class LazyBlogStudio:
         self.save_session(safe_id, meta)
         return self.session_payload(safe_id)
 
+    def auto_rename_session(self, session_id: str) -> dict[str, Any]:
+        safe_id = safe_session_id(session_id)
+        session = self.load_session(safe_id)
+        recent_messages = [self.read_message(path) for path in self.message_paths(safe_id)[-20:]]
+        if not recent_messages:
+            raise WebAppError("cannot auto-rename an empty chat")
+        prompt = """Generate a concise chat-history title.
+
+Rules:
+- Use the supplied session transcript only.
+- Answer with only the title text in the `answer` field.
+- 3 to 8 words is ideal.
+- Keep the title in the dominant language of the chat.
+- Do not include quotes, labels, prefixes, markdown, or punctuation unless it is part of a proper noun."""
+        result = self.respond_with_codex(
+            {
+                "tool": "response",
+                "schema": "response",
+                "session_id": safe_id,
+                "prompt": prompt,
+                "input": {
+                    "current_title": session.get("title", ""),
+                    "recent_messages": recent_messages,
+                },
+                "wait": True,
+            }
+        )
+        job = result.get("job") if isinstance(result.get("job"), dict) else {}
+        if job.get("status") != "succeeded":
+            raise WebAppError(f"auto rename failed: {job.get('error') or job.get('status') or 'unknown error'}")
+        output = result.get("output") if isinstance(result.get("output"), dict) else {}
+        title = str(output.get("answer") or output.get("summary") or "").strip()
+        title = re.sub(r"^[`\"'“”‘’]+|[`\"'“”‘’]+$", "", title).strip()
+        title = re.sub(r"^(title|chat title)\s*:\s*", "", title, flags=re.IGNORECASE).strip()
+        title = " ".join(title.split())[:120]
+        if not title:
+            raise WebAppError("auto rename returned an empty title")
+        payload = self.rename_session(safe_id, title)
+        payload["auto_rename"] = {"title": title, "job": job}
+        return payload
+
     def delete_session(self, session_id: str) -> dict[str, Any]:
         safe_id = safe_session_id(session_id)
         session_dir = self.session_dir(safe_id)
@@ -1595,6 +1636,7 @@ INDEX_HTML = r"""<!doctype html>
           <button class="session-more" type="button" aria-label="Chat actions" aria-expanded="false">&#8943;</button>
           <div class="session-menu">
             <button type="button" data-action="rename">Rename</button>
+            <button type="button" data-action="auto-rename">Auto rename</button>
             <button type="button" class="danger" data-action="delete">Delete</button>
           </div>
         `;
@@ -1615,6 +1657,11 @@ INDEX_HTML = r"""<!doctype html>
           event.stopPropagation();
           closeSessionMenus();
           renameSession(item.id, title);
+        });
+        el.querySelector('[data-action="auto-rename"]').addEventListener("click", (event) => {
+          event.stopPropagation();
+          closeSessionMenus();
+          autoRenameSession(item.id);
         });
         el.querySelector('[data-action="delete"]').addEventListener("click", (event) => {
           event.stopPropagation();
@@ -1744,6 +1791,18 @@ INDEX_HTML = r"""<!doctype html>
         renderSession(data);
       } catch (err) {
         $("publishLog").textContent = err.message;
+      }
+    }
+
+    async function autoRenameSession(id) {
+      setBusy("auto-renaming chat...");
+      try {
+        const data = await api("/api/session/auto-rename", { session_id: id });
+        renderSession(data);
+      } catch (err) {
+        $("publishLog").textContent = err.message;
+      } finally {
+        setBusy("");
       }
     }
 
@@ -2308,6 +2367,9 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
                     return
                 if parsed.path == "/api/session/rename":
                     self.send_json(app.rename_session(str(payload.get("session_id", "")), str(payload.get("title", ""))))
+                    return
+                if parsed.path == "/api/session/auto-rename":
+                    self.send_json(app.auto_rename_session(str(payload.get("session_id", ""))))
                     return
                 if parsed.path == "/api/session/delete":
                     self.send_json(app.delete_session(str(payload.get("session_id", ""))))
