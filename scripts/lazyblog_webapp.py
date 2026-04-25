@@ -341,6 +341,27 @@ class LazyBlogStudio:
                 continue
         return sorted(sessions, key=lambda item: item.get("updated_at", ""), reverse=True)
 
+    def rename_session(self, session_id: str, title: str) -> dict[str, Any]:
+        safe_id = safe_session_id(session_id)
+        clean_title = " ".join(title.strip().split())[:120]
+        if not clean_title:
+            raise WebAppError("chat title cannot be empty")
+        meta = self.load_session(safe_id)
+        meta["title"] = clean_title
+        self.save_session(safe_id, meta)
+        return self.session_payload(safe_id)
+
+    def delete_session(self, session_id: str) -> dict[str, Any]:
+        safe_id = safe_session_id(session_id)
+        session_dir = self.session_dir(safe_id)
+        if not session_dir.exists():
+            raise WebAppError(f"unknown session: {safe_id}")
+        trash_dir = CHAT_ROOT / ".trash"
+        trash_dir.mkdir(parents=True, exist_ok=True)
+        target = trash_dir / f"{stamp()}-{safe_id}"
+        session_dir.rename(target)
+        return {"deleted": safe_id, "trash_path": str(target.relative_to(ROOT_DIR)), "sessions": self.list_sessions()}
+
     def append_message(self, session_id: str, role: str, content: str, extra: dict[str, Any] | None = None) -> Path:
         meta = self.load_session(session_id)
         msg_id = f"{stamp()}-{uuid.uuid4().hex[:6]}-{role}"
@@ -1219,7 +1240,7 @@ INDEX_HTML = r"""<!doctype html>
       overflow-x: hidden;
     }
     button, input, textarea, select { font: inherit; }
-    .shell { display: grid; grid-template-columns: 260px minmax(0, 1fr) 360px; gap: 18px; min-height: 100vh; padding: 20px; }
+    .shell { display: grid; grid-template-columns: 260px minmax(0, 1fr) 360px; gap: 18px; width: 100%; max-width: 100vw; min-height: 100vh; padding: 20px; overflow-x: hidden; }
     .panel { min-width: 0; background: rgba(255, 250, 240, 0.82); border: 1px solid var(--line); border-radius: 28px; box-shadow: var(--shadow); backdrop-filter: blur(18px); overflow: hidden; }
     .side, .publish { min-width: 0; padding: 18px; }
     .brand { padding: 22px; border-bottom: 1px solid var(--line); background: linear-gradient(135deg, rgba(15, 118, 110, 0.12), rgba(217, 107, 67, 0.12)); }
@@ -1228,23 +1249,30 @@ INDEX_HTML = r"""<!doctype html>
     h2 { font-size: 20px; letter-spacing: -0.03em; }
     .sub { color: var(--muted); margin: 10px 0 0; font-size: 15px; }
     .session-list { display: grid; gap: 10px; margin-top: 16px; }
-    .session { border: 1px solid var(--line); border-radius: 18px; padding: 12px; cursor: pointer; background: rgba(255, 255, 255, 0.42); transition: transform 160ms ease, border-color 160ms ease, background 160ms ease; }
+    .session { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; border: 1px solid var(--line); border-radius: 18px; padding: 12px; cursor: pointer; background: rgba(255, 255, 255, 0.42); transition: transform 160ms ease, border-color 160ms ease, background 160ms ease; }
     .session:hover, .session.active { transform: translateY(-1px); border-color: rgba(15, 118, 110, 0.42); background: rgba(255, 255, 255, 0.68); }
+    .session-main { min-width: 0; }
     .session strong { display: block; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .session span { display: block; color: var(--muted); font-size: 12px; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .chat { display: grid; grid-template-rows: auto 1fr auto; min-height: calc(100vh - 40px); }
-    .chat-head { padding: 22px 24px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+    .session-more { width: 30px; height: 30px; padding: 0; border-radius: 999px; background: rgba(29, 37, 32, 0.06); color: var(--ink); font-size: 18px; line-height: 1; }
+    .session-menu { position: absolute; right: 10px; top: 42px; z-index: 20; display: none; min-width: 128px; padding: 6px; border: 1px solid var(--line); border-radius: 14px; background: rgba(255, 250, 240, 0.96); box-shadow: 0 18px 40px rgba(28, 45, 38, 0.16); }
+    .session.menu-open .session-menu { display: grid; gap: 4px; }
+    .session-menu button { width: 100%; padding: 8px 10px; border-radius: 10px; background: transparent; color: var(--ink); text-align: left; }
+    .session-menu button:hover { background: rgba(29, 37, 32, 0.08); transform: none; }
+    .session-menu .danger { color: #9b2f16; }
+    .chat { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; min-width: 0; max-width: 100%; min-height: calc(100vh - 40px); overflow: hidden; }
+    .chat-head { min-width: 0; padding: 22px 24px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 16px; }
     .chat-head > div:first-child { min-width: 0; }
     #chatTitle, #chatMeta, #modelLabel { overflow: hidden; text-overflow: ellipsis; }
     #chatTitle, #chatMeta { white-space: nowrap; }
-    .status { display: inline-flex; gap: 8px; align-items: center; padding: 8px 12px; border-radius: 999px; background: rgba(15, 118, 110, 0.1); color: var(--teal-dark); font-size: 13px; white-space: nowrap; }
+    .status { min-width: 0; max-width: 220px; display: inline-flex; gap: 8px; align-items: center; padding: 8px 12px; border-radius: 999px; background: rgba(15, 118, 110, 0.1); color: var(--teal-dark); font-size: 13px; white-space: nowrap; }
     #modelLabel { display: block; min-width: 0; }
     .dot { width: 8px; height: 8px; border-radius: 999px; background: var(--teal); box-shadow: 0 0 0 6px rgba(15, 118, 110, 0.12); }
-    .messages { padding: 24px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; }
-    .msg { max-width: min(760px, 88%); padding: 14px 16px; border-radius: 22px; border: 1px solid var(--line); white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.48; animation: rise 220ms ease both; }
+    .messages { min-width: 0; min-height: 0; max-width: 100%; padding: 24px; overflow-y: auto; overflow-x: hidden; display: flex; flex-direction: column; gap: 14px; }
+    .msg { min-width: 0; max-width: min(760px, 88%); padding: 14px 16px; border-radius: 22px; border: 1px solid var(--line); white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; line-height: 1.48; animation: rise 220ms ease both; }
     .msg.user { align-self: flex-end; background: linear-gradient(135deg, rgba(15, 118, 110, 0.93), rgba(11, 79, 74, 0.93)); color: white; border-color: rgba(15, 118, 110, 0.3); }
     .msg.assistant { align-self: flex-start; background: rgba(255, 255, 255, 0.62); }
-    .composer { padding: 18px; border-top: 1px solid var(--line); background: rgba(255, 244, 217, 0.58); }
+    .composer { min-width: 0; max-width: 100%; padding: 18px; border-top: 1px solid var(--line); background: rgba(255, 244, 217, 0.58); overflow: hidden; }
     textarea { width: 100%; min-height: 108px; resize: vertical; border: 1px solid rgba(39, 55, 46, 0.18); border-radius: 20px; background: rgba(255, 255, 255, 0.72); color: var(--ink); padding: 14px 15px; outline: none; line-height: 1.45; }
     textarea:focus, select:focus, input:focus { border-color: rgba(15, 118, 110, 0.55); box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.12); }
     .row { display: flex; gap: 10px; align-items: center; margin-top: 12px; }
@@ -1472,18 +1500,60 @@ INDEX_HTML = r"""<!doctype html>
       }[ch]));
     }
 
+    function closeSessionMenus() {
+      document.querySelectorAll(".session.menu-open").forEach((el) => el.classList.remove("menu-open"));
+    }
+
+    function clearChat() {
+      state.sessionId = null;
+      $("chatTitle").textContent = "New chat";
+      $("chatMeta").textContent = "Messages will be saved as Markdown.";
+      $("messages").innerHTML = "";
+      $("draftPreview").value = "";
+      $("publishLog").textContent = "No draft yet.";
+    }
+
     function renderSessions(sessions) {
       const root = $("sessions");
       root.innerHTML = "";
       for (const item of sessions) {
         const el = document.createElement("div");
         el.className = "session" + (item.id === state.sessionId ? " active" : "");
-        el.innerHTML = `<strong>${escapeHtml(item.title || item.id)}</strong><span>${escapeHtml(item.updated_at || "")}</span>`;
-        el.onclick = () => {
+        const title = item.title || item.id;
+        el.innerHTML = `
+          <div class="session-main">
+            <strong>${escapeHtml(title)}</strong>
+            <span>${escapeHtml(item.updated_at || "")}</span>
+          </div>
+          <button class="session-more" type="button" aria-label="Chat actions" aria-expanded="false">&#8943;</button>
+          <div class="session-menu">
+            <button type="button" data-action="rename">Rename</button>
+            <button type="button" class="danger" data-action="delete">Delete</button>
+          </div>
+        `;
+        el.addEventListener("click", () => {
+          closeSessionMenus();
           loadSession(item.id);
           shell.classList.remove("nav-open");
           $("mobileMenuToggle").setAttribute("aria-expanded", "false");
-        };
+        });
+        el.querySelector(".session-more").addEventListener("click", (event) => {
+          event.stopPropagation();
+          const wasOpen = el.classList.contains("menu-open");
+          closeSessionMenus();
+          el.classList.toggle("menu-open", !wasOpen);
+          el.querySelector(".session-more").setAttribute("aria-expanded", String(!wasOpen));
+        });
+        el.querySelector('[data-action="rename"]').addEventListener("click", (event) => {
+          event.stopPropagation();
+          closeSessionMenus();
+          renameSession(item.id, title);
+        });
+        el.querySelector('[data-action="delete"]').addEventListener("click", (event) => {
+          event.stopPropagation();
+          closeSessionMenus();
+          deleteSession(item.id, title);
+        });
         root.appendChild(el);
       }
     }
@@ -1544,9 +1614,13 @@ INDEX_HTML = r"""<!doctype html>
       loadJobs();
     }
 
-    async function loadSessions() {
+    async function loadSessions(options = {}) {
       const data = await api("/api/sessions");
-      renderSessions(data.sessions || []);
+      const sessions = data.sessions || [];
+      renderSessions(sessions);
+      if (options.autoload && !state.sessionId && sessions.length > 0) {
+        await loadSession(sessions[0].id);
+      }
     }
 
     async function loadJobs() {
@@ -1558,6 +1632,35 @@ INDEX_HTML = r"""<!doctype html>
     async function loadSession(id) {
       const data = await api(`/api/session?id=${encodeURIComponent(id)}`);
       renderSession(data);
+    }
+
+    async function renameSession(id, currentTitle) {
+      const title = window.prompt("Rename chat", currentTitle || "");
+      if (title === null) return;
+      const cleanTitle = title.trim();
+      if (!cleanTitle || cleanTitle === currentTitle) return;
+      try {
+        const data = await api("/api/session/rename", { session_id: id, title: cleanTitle });
+        renderSession(data);
+      } catch (err) {
+        $("publishLog").textContent = err.message;
+      }
+    }
+
+    async function deleteSession(id, title) {
+      if (!window.confirm(`Delete chat history "${title}"? It will be moved to local trash.`)) return;
+      try {
+        const data = await api("/api/session/delete", { session_id: id });
+        renderSessions(data.sessions || []);
+        if (state.sessionId === id) {
+          clearChat();
+          if ((data.sessions || []).length > 0) {
+            await loadSession(data.sessions[0].id);
+          }
+        }
+      } catch (err) {
+        $("publishLog").textContent = err.message;
+      }
     }
 
     async function sendMessage(event) {
@@ -1636,22 +1739,18 @@ INDEX_HTML = r"""<!doctype html>
       $("publishToggle").setAttribute("aria-expanded", String(opened));
     });
     $("newSession").addEventListener("click", () => {
-      state.sessionId = null;
       shell.classList.remove("nav-open");
       $("mobileMenuToggle").setAttribute("aria-expanded", "false");
-      $("chatTitle").textContent = "New chat";
-      $("chatMeta").textContent = "Messages will be saved as Markdown.";
-      $("messages").innerHTML = "";
-      $("draftPreview").value = "";
-      $("publishLog").textContent = "No draft yet.";
+      clearChat();
       loadSessions();
     });
+    document.addEventListener("click", closeSessionMenus);
     if ("serviceWorker" in navigator) {
       window.addEventListener("load", () => {
         navigator.serviceWorker.register("/service-worker.js").catch(() => {});
       });
     }
-    loadSessions().catch((err) => { $("publishLog").textContent = err.message; });
+    loadSessions({ autoload: true }).catch((err) => { $("publishLog").textContent = err.message; });
     loadJobs().catch(() => {});
     setInterval(() => loadJobs().catch(() => {}), 4000);
   </script>
@@ -2083,6 +2182,12 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
                     )
                     return
                 if not self.authorize_request(parsed.path):
+                    return
+                if parsed.path == "/api/session/rename":
+                    self.send_json(app.rename_session(str(payload.get("session_id", "")), str(payload.get("title", ""))))
+                    return
+                if parsed.path == "/api/session/delete":
+                    self.send_json(app.delete_session(str(payload.get("session_id", ""))))
                     return
                 if parsed.path == "/api/chat":
                     self.send_json(app.reply(str(payload.get("message", "")), payload.get("session_id") or None))
