@@ -1216,11 +1216,12 @@ INDEX_HTML = r"""<!doctype html>
         radial-gradient(circle at 92% 12%, rgba(15, 118, 110, 0.18), transparent 24rem),
         linear-gradient(135deg, #fffaf0 0%, #f3ead7 52%, #d9ede8 100%);
       min-height: 100vh;
+      overflow-x: hidden;
     }
     button, input, textarea, select { font: inherit; }
     .shell { display: grid; grid-template-columns: 260px minmax(0, 1fr) 360px; gap: 18px; min-height: 100vh; padding: 20px; }
-    .panel { background: rgba(255, 250, 240, 0.82); border: 1px solid var(--line); border-radius: 28px; box-shadow: var(--shadow); backdrop-filter: blur(18px); overflow: hidden; }
-    .side, .publish { padding: 18px; }
+    .panel { min-width: 0; background: rgba(255, 250, 240, 0.82); border: 1px solid var(--line); border-radius: 28px; box-shadow: var(--shadow); backdrop-filter: blur(18px); overflow: hidden; }
+    .side, .publish { min-width: 0; padding: 18px; }
     .brand { padding: 22px; border-bottom: 1px solid var(--line); background: linear-gradient(135deg, rgba(15, 118, 110, 0.12), rgba(217, 107, 67, 0.12)); }
     h1, h2 { font-family: "Fraunces", Georgia, serif; line-height: 1; margin: 0; }
     h1 { font-size: 34px; letter-spacing: -0.05em; }
@@ -1230,13 +1231,17 @@ INDEX_HTML = r"""<!doctype html>
     .session { border: 1px solid var(--line); border-radius: 18px; padding: 12px; cursor: pointer; background: rgba(255, 255, 255, 0.42); transition: transform 160ms ease, border-color 160ms ease, background 160ms ease; }
     .session:hover, .session.active { transform: translateY(-1px); border-color: rgba(15, 118, 110, 0.42); background: rgba(255, 255, 255, 0.68); }
     .session strong { display: block; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .session span { display: block; color: var(--muted); font-size: 12px; margin-top: 4px; }
+    .session span { display: block; color: var(--muted); font-size: 12px; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .chat { display: grid; grid-template-rows: auto 1fr auto; min-height: calc(100vh - 40px); }
     .chat-head { padding: 22px 24px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+    .chat-head > div:first-child { min-width: 0; }
+    #chatTitle, #chatMeta, #modelLabel { overflow: hidden; text-overflow: ellipsis; }
+    #chatTitle, #chatMeta { white-space: nowrap; }
     .status { display: inline-flex; gap: 8px; align-items: center; padding: 8px 12px; border-radius: 999px; background: rgba(15, 118, 110, 0.1); color: var(--teal-dark); font-size: 13px; white-space: nowrap; }
+    #modelLabel { display: block; min-width: 0; }
     .dot { width: 8px; height: 8px; border-radius: 999px; background: var(--teal); box-shadow: 0 0 0 6px rgba(15, 118, 110, 0.12); }
     .messages { padding: 24px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; }
-    .msg { max-width: min(760px, 88%); padding: 14px 16px; border-radius: 22px; border: 1px solid var(--line); white-space: pre-wrap; line-height: 1.48; animation: rise 220ms ease both; }
+    .msg { max-width: min(760px, 88%); padding: 14px 16px; border-radius: 22px; border: 1px solid var(--line); white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.48; animation: rise 220ms ease both; }
     .msg.user { align-self: flex-end; background: linear-gradient(135deg, rgba(15, 118, 110, 0.93), rgba(11, 79, 74, 0.93)); color: white; border-color: rgba(15, 118, 110, 0.3); }
     .msg.assistant { align-self: flex-start; background: rgba(255, 255, 255, 0.62); }
     .composer { padding: 18px; border-top: 1px solid var(--line); background: rgba(255, 244, 217, 0.58); }
@@ -1265,12 +1270,112 @@ INDEX_HTML = r"""<!doctype html>
     .job-status.running, .job-status.queued { background: rgba(227, 169, 47, 0.22); color: #68470e; }
     .job-status.succeeded { background: rgba(15, 118, 110, 0.14); color: var(--teal-dark); }
     .job-status.failed { background: rgba(217, 107, 67, 0.18); color: #7a2f18; }
+    .mobile-menu-toggle, .mobile-publish-toggle { display: none; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
     @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
     @media (max-width: 1080px) { .shell { grid-template-columns: 1fr; } .chat { min-height: 70vh; } .publish { order: 3; } }
+    @media (max-width: 720px) {
+      .shell { display: block; min-height: 100svh; padding: 52px 8px 8px; }
+      .mobile-menu-toggle {
+        position: fixed;
+        top: 10px;
+        left: 10px;
+        z-index: 40;
+        display: inline-flex;
+        width: 42px;
+        height: 38px;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        gap: 4px;
+        padding: 0;
+        background: rgba(255, 250, 240, 0.92);
+        color: var(--ink);
+        border: 1px solid var(--line);
+        box-shadow: 0 12px 30px rgba(28, 45, 38, 0.12);
+      }
+      .mobile-menu-toggle span { width: 18px; height: 2px; border-radius: 999px; background: currentColor; }
+      .side {
+        display: none;
+        margin-bottom: 8px;
+        padding: 12px;
+        border-radius: 22px;
+        max-height: 46vh;
+        overflow-y: auto;
+      }
+      .shell.nav-open .side { display: block; }
+      .brand { padding: 14px; border-radius: 18px; }
+      h1 { font-size: 28px; }
+      h2 { font-size: 18px; }
+      .sub { font-size: 13px; }
+      .session-list { gap: 8px; margin-top: 10px; }
+      .session { padding: 9px 10px; border-radius: 14px; }
+      .session strong { font-size: 14px; }
+      .chat {
+        min-height: calc(100svh - 60px);
+        grid-template-rows: auto minmax(0, 1fr) auto;
+        border-radius: 22px;
+      }
+      .chat-head { padding: 10px 12px; gap: 8px; }
+      .chat-head .sub { margin-top: 4px; font-size: 12px; max-width: 100%; }
+      .status { flex: 0 1 118px; max-width: 118px; gap: 6px; padding: 6px 8px; font-size: 12px; }
+      .dot { width: 7px; height: 7px; box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.12); }
+      .messages { padding: 10px; gap: 8px; }
+      .msg { max-width: 96%; padding: 10px 11px; border-radius: 16px; line-height: 1.38; }
+      .msg.user { max-width: 94%; }
+      .composer {
+        position: sticky;
+        bottom: 0;
+        z-index: 30;
+        padding: 8px;
+        background: rgba(255, 244, 217, 0.88);
+      }
+      textarea { min-height: 72px; max-height: 32vh; border-radius: 16px; padding: 10px 11px; }
+      .composer .row { position: relative; flex-wrap: nowrap; gap: 6px; margin-top: 8px; padding-bottom: 16px; align-items: center; }
+      .composer .row button { min-width: 0; padding: 9px 10px; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      #sendButton { flex: 1 1 44%; }
+      #draftButton { flex: 1 1 34%; }
+      #busyLabel { position: absolute; left: 2px; right: 2px; bottom: -2px; flex: none; font-size: 12px; margin-top: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .mobile-publish-toggle {
+        display: inline-flex;
+        flex: 0 0 40px;
+        width: 40px;
+        height: 36px;
+        align-items: center;
+        justify-content: center;
+      }
+      .mobile-publish-toggle .triangle {
+        width: 0;
+        height: 0;
+        border-left: 6px solid transparent;
+        border-right: 6px solid transparent;
+        border-top: 8px solid currentColor;
+        transition: transform 160ms ease;
+      }
+      .shell.publish-open .mobile-publish-toggle .triangle { transform: rotate(180deg); }
+      .publish {
+        display: none;
+        margin-top: 8px;
+        padding: 12px;
+        border-radius: 22px;
+        max-height: 58vh;
+        overflow-y: auto;
+      }
+      .shell.publish-open .publish { display: block; }
+      .field { margin-top: 10px; }
+      .publish .row { flex-wrap: wrap; gap: 8px; }
+      .publish button { padding: 9px 12px; }
+      .preview { height: 180px; min-height: 140px; }
+      .log { padding: 10px; font-size: 12px; }
+      .monitor-head { margin-top: 14px; }
+    }
   </style>
 </head>
 <body>
-  <main class="shell">
+  <main class="shell" id="shell">
+    <button id="mobileMenuToggle" class="mobile-menu-toggle" type="button" aria-label="Toggle chat history" aria-expanded="false">
+      <span></span><span></span><span></span>
+    </button>
     <aside class="panel side">
       <div class="brand">
         <h1>LazyBlog Studio</h1>
@@ -1294,13 +1399,14 @@ INDEX_HTML = r"""<!doctype html>
       <form id="composer" class="composer">
         <textarea id="messageInput" placeholder="Write a note, idea, outline, memory, or instruction. The reply tool will store it and respond; the task tool can turn the session into a post."></textarea>
         <div class="row">
-          <button id="sendButton" type="submit">Send and Store</button>
+          <button id="sendButton" type="submit">Send & Store</button>
           <button id="draftButton" class="secondary" type="button">Draft Post</button>
+          <button id="publishToggle" class="secondary mobile-publish-toggle" type="button" aria-label="Toggle publish tools" aria-controls="publishPanel" aria-expanded="false"><span class="triangle"></span><span class="sr-only">Publish tools</span></button>
           <span class="sub" id="busyLabel"></span>
         </div>
       </form>
     </section>
-    <aside class="panel publish">
+    <aside class="panel publish" id="publishPanel">
       <h2>Publish</h2>
       <p class="sub">The publish button creates a draft if needed, converts Markdown to WordPress HTML, creates terms, and posts through REST auth.</p>
       <div class="field">
@@ -1335,6 +1441,7 @@ INDEX_HTML = r"""<!doctype html>
   <script>
     const state = { sessionId: null, busy: false };
     const $ = (id) => document.getElementById(id);
+    const shell = $("shell");
     $("modelLabel").textContent = "__MODEL_LABEL__";
 
     function setBusy(label) {
@@ -1372,7 +1479,11 @@ INDEX_HTML = r"""<!doctype html>
         const el = document.createElement("div");
         el.className = "session" + (item.id === state.sessionId ? " active" : "");
         el.innerHTML = `<strong>${escapeHtml(item.title || item.id)}</strong><span>${escapeHtml(item.updated_at || "")}</span>`;
-        el.onclick = () => loadSession(item.id);
+        el.onclick = () => {
+          loadSession(item.id);
+          shell.classList.remove("nav-open");
+          $("mobileMenuToggle").setAttribute("aria-expanded", "false");
+        };
         root.appendChild(el);
       }
     }
@@ -1516,8 +1627,18 @@ INDEX_HTML = r"""<!doctype html>
     $("redraftButton").addEventListener("click", () => publishPost(true));
     $("refreshSessions").addEventListener("click", loadSessions);
     $("refreshJobs").addEventListener("click", loadJobs);
+    $("mobileMenuToggle").addEventListener("click", () => {
+      const opened = shell.classList.toggle("nav-open");
+      $("mobileMenuToggle").setAttribute("aria-expanded", String(opened));
+    });
+    $("publishToggle").addEventListener("click", () => {
+      const opened = shell.classList.toggle("publish-open");
+      $("publishToggle").setAttribute("aria-expanded", String(opened));
+    });
     $("newSession").addEventListener("click", () => {
       state.sessionId = null;
+      shell.classList.remove("nav-open");
+      $("mobileMenuToggle").setAttribute("aria-expanded", "false");
       $("chatTitle").textContent = "New chat";
       $("chatMeta").textContent = "Messages will be saved as Markdown.";
       $("messages").innerHTML = "";
@@ -1663,8 +1784,8 @@ PWA_MANIFEST = {
 }
 
 
-SERVICE_WORKER = r"""const CACHE_NAME = "lazyblog-studio-v1";
-const APP_SHELL = ["/", "/manifest.webmanifest", "/icons/lazyblog.svg", "/icons/lazyblog-192.png", "/icons/lazyblog-512.png"];
+SERVICE_WORKER = r"""const CACHE_NAME = "lazyblog-studio-v2";
+const APP_SHELL = ["/manifest.webmanifest", "/icons/lazyblog.svg", "/icons/lazyblog-192.png", "/icons/lazyblog-512.png"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL)));
@@ -1683,6 +1804,7 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
   if (url.origin !== self.location.origin || url.pathname.startsWith("/api/")) return;
+  if (url.pathname === "/" || url.pathname === "/login") return;
   if (event.request.method !== "GET") return;
   event.respondWith(
     caches.match(event.request).then((cached) => {
