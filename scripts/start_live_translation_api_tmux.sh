@@ -9,12 +9,22 @@ set -euo pipefail
 
 SESSION_NAME="${LAZYBLOG_TMUX_SESSION:-lazyblog-studio-live}"
 ROOT_DIR="${LAZYBLOG_RUNTIME_DIR:-$HOME/webgit/LazyBlog-runtime}"
-PYTHON_BIN="${LAZYBLOG_PYTHON:-$HOME/miniconda3/bin/python3.12}"
+
+if [ -f "$ROOT_DIR/.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$ROOT_DIR/.env"
+  set +a
+fi
+
+PYTHON_BIN="${LAZYBLOG_PYTHON:-$HOME/miniconda3/bin/python3}"
 DEFAULT_HOST="${LAZYBLOG_WEBAPP_HOST:-127.0.0.1}"
 DEFAULT_PORT="${LAZYBLOG_WEBAPP_PORT:-8765}"
 DEFAULT_MODEL="${LAZYBLOG_WEBAPP_MODEL:-gpt-5.4}"
 DEFAULT_REASONING="${LAZYBLOG_WEBAPP_REASONING:-low}"
 CODEX_BIN_DIR="${LAZYBLOG_CODEX_BIN_DIR:-$HOME/.local/codex-cli/node_modules/.bin}"
+NGROK_URL="${LAZYBLOG_NGROK_URL:-}"
+NGROK_BIN="${LAZYBLOG_NGROK_BIN:-$(command -v ngrok || echo ngrok)}"
 
 if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
   echo "Tmux session '$SESSION_NAME' already exists."
@@ -50,4 +60,29 @@ exec "$PYTHON_BIN" scripts/lazyblog_webapp.py \
 EOF
 
 tmux new-session -d -s "$SESSION_NAME" "bash -lc $(printf '%q' "$INNER_COMMAND")"
-echo "Session '$SESSION_NAME' created. LazyBlog translation API is launching."
+
+if [ -n "$NGROK_URL" ]; then
+  read -r -d '' NGROK_COMMAND <<EOF || true
+cd "$ROOT_DIR"
+set -a
+if [ -f .env ]; then
+  source .env
+fi
+set +a
+if ! command -v "$NGROK_BIN" >/dev/null 2>&1; then
+  echo "ngrok binary not found: $NGROK_BIN"
+  echo "Install ngrok or set LAZYBLOG_NGROK_BIN=/path/to/ngrok, then restart tmux session '$SESSION_NAME'."
+  echo "Requested tunnel: ngrok http --url=\${LAZYBLOG_NGROK_URL:-$NGROK_URL} \${LAZYBLOG_WEBAPP_PORT:-$DEFAULT_PORT}"
+  exec bash
+fi
+"$NGROK_BIN" http --url="\${LAZYBLOG_NGROK_URL:-$NGROK_URL}" "\${LAZYBLOG_WEBAPP_PORT:-$DEFAULT_PORT}"
+status=\$?
+echo "ngrok exited with status \$status. Fix the issue above, then rerun the same command from this pane."
+exec bash
+EOF
+  tmux split-window -h -t "$SESSION_NAME":0 "bash -lc $(printf '%q' "$NGROK_COMMAND")"
+  tmux select-layout -t "$SESSION_NAME":0 even-horizontal >/dev/null
+  echo "Ngrok pane is forwarding https://$NGROK_URL -> http://127.0.0.1:$DEFAULT_PORT"
+fi
+
+echo "Session '$SESSION_NAME' created. LazyBlog Studio is launching."

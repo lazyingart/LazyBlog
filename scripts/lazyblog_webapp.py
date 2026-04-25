@@ -42,6 +42,8 @@ CODEX_RESPONSE_SCHEMA = ROOT_DIR / "schemas" / "lazyblog_codex_response.schema.j
 CODEX_TRANSLATION_SCHEMA = ROOT_DIR / "schemas" / "lazyblog_web_translation.schema.json"
 DEFAULT_MODEL = "gpt-5.4"
 DEFAULT_REASONING = "low"
+STUDIO_AUTH_COOKIE = "lazyblog_studio_auth"
+STUDIO_AUTH_TTL_SECONDS = 60 * 60 * 24 * 30
 
 
 class WebAppError(RuntimeError):
@@ -61,6 +63,52 @@ def bool_env(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def studio_username() -> str:
+    return os.environ.get("LAZYBLOG_STUDIO_USERNAME", "lachlan").strip() or "lachlan"
+
+
+def studio_login_token() -> str:
+    return os.environ.get("LAZYBLOG_STUDIO_LOGIN_TOKEN", "").strip()
+
+
+def studio_auth_enabled() -> bool:
+    return bool(studio_login_token()) and not bool_env("LAZYBLOG_STUDIO_AUTH_DISABLED", False)
+
+
+def studio_auth_secret() -> str:
+    return studio_login_token() or os.environ.get("LAZYBLOG_API_TOKEN", "").strip()
+
+
+def make_studio_cookie(username: str) -> str:
+    expires = int(time.time()) + STUDIO_AUTH_TTL_SECONDS
+    message = f"{username}:{expires}"
+    signature = hmac.new(studio_auth_secret().encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+    return urllib.parse.quote(f"{message}:{signature}", safe="")
+
+
+def verify_studio_cookie(raw_cookie: str) -> bool:
+    if not studio_auth_enabled():
+        return True
+    cookies: dict[str, str] = {}
+    for chunk in raw_cookie.split(";"):
+        name, separator, value = chunk.strip().partition("=")
+        if separator:
+            cookies[name] = value
+    raw_value = cookies.get(STUDIO_AUTH_COOKIE, "")
+    if not raw_value:
+        return False
+    try:
+        username, expires_text, signature = urllib.parse.unquote(raw_value).split(":", 2)
+        expires = int(expires_text)
+    except ValueError:
+        return False
+    if username != studio_username() or expires < int(time.time()):
+        return False
+    message = f"{username}:{expires}"
+    expected = hmac.new(studio_auth_secret().encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(signature, expected)
 
 
 def slugify(value: str, fallback: str = "post") -> str:
@@ -1303,6 +1351,10 @@ INDEX_HTML = r"""<!doctype html>
       };
       const res = await fetch(path, options);
       const data = await res.json();
+      if (res.status === 401 && data.login_url) {
+        window.location.href = data.login_url;
+        throw new Error("Login required.");
+      }
       if (!res.ok || data.ok === false) throw new Error(data.error || res.statusText);
       return data;
     }
@@ -1487,6 +1539,86 @@ INDEX_HTML = r"""<!doctype html>
 """
 
 
+LOGIN_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0f766e">
+  <title>LazyBlog Studio Login</title>
+  <style>
+    @import url("https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,650&family=Newsreader:opsz,wght@6..72,400;6..72,600&display=swap");
+    :root { --ink: #1d2520; --muted: #667069; --teal: #0f766e; --clay: #d96b43; --gold: #e3a92f; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      color: var(--ink);
+      font-family: "Newsreader", Georgia, serif;
+      background:
+        radial-gradient(circle at 18% 18%, rgba(227, 169, 47, 0.34), transparent 26rem),
+        radial-gradient(circle at 82% 14%, rgba(15, 118, 110, 0.2), transparent 24rem),
+        linear-gradient(135deg, #fffaf0 0%, #f3ead7 52%, #d9ede8 100%);
+      padding: 24px;
+    }
+    .card {
+      width: min(460px, 100%);
+      border: 1px solid rgba(39, 55, 46, 0.16);
+      border-radius: 32px;
+      padding: 30px;
+      background: rgba(255, 250, 240, 0.86);
+      box-shadow: 0 24px 70px rgba(28, 45, 38, 0.16);
+      backdrop-filter: blur(18px);
+    }
+    h1 { font-family: "Fraunces", Georgia, serif; font-size: 42px; line-height: 0.95; letter-spacing: -0.05em; margin: 0; }
+    p { color: var(--muted); line-height: 1.5; }
+    label { display: block; font-size: 13px; color: var(--muted); margin: 16px 0 6px 4px; }
+    input { width: 100%; border: 1px solid rgba(39, 55, 46, 0.18); border-radius: 18px; background: rgba(255, 255, 255, 0.7); padding: 12px 14px; font: inherit; outline: none; }
+    input:focus { border-color: rgba(15, 118, 110, 0.55); box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.12); }
+    button { width: 100%; margin-top: 20px; border: 0; border-radius: 999px; padding: 13px 18px; background: linear-gradient(135deg, var(--clay), var(--gold)); color: #231b12; font: inherit; font-weight: 600; cursor: pointer; }
+    .error { margin-top: 14px; color: #8a2b12; min-height: 1.4em; }
+    .hint { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color: var(--teal); overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <form class="card" id="loginForm">
+    <h1>LazyBlog Studio</h1>
+    <p>Public tunnel access is locked. Log in as <span class="hint">__USERNAME__</span> with the Studio token.</p>
+    <label for="username">Account</label>
+    <input id="username" name="username" value="__USERNAME__" autocomplete="username" required>
+    <label for="token">Login token</label>
+    <input id="token" name="token" type="password" autocomplete="current-password" autofocus required>
+    <button type="submit">Enter Studio</button>
+    <div class="error" id="error"></div>
+  </form>
+  <script>
+    document.getElementById("loginForm").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const error = document.getElementById("error");
+      error.textContent = "";
+      const res = await fetch("/api/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: document.getElementById("username").value,
+          token: document.getElementById("token").value
+        })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.ok === false) {
+        error.textContent = data.error || "Login failed.";
+        return;
+      }
+      window.location.href = "/";
+    });
+  </script>
+</body>
+</html>
+"""
+
+
 PWA_MANIFEST = {
     "name": "LazyBlog Studio",
     "short_name": "LazyBlog",
@@ -1634,21 +1766,32 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
         def log_message(self, fmt: str, *args: Any) -> None:
             sys.stderr.write("%s - - [%s] %s\n" % (self.address_string(), self.log_date_time_string(), fmt % args))
 
-        def send_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
+        def send_json(
+            self,
+            payload: dict[str, Any],
+            status: HTTPStatus = HTTPStatus.OK,
+            headers: dict[str, str] | None = None,
+        ) -> None:
             body = json.dumps({"ok": status.value < 400, **payload}, ensure_ascii=False).encode("utf-8")
             self.send_response(status.value)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
 
-        def send_html(self) -> None:
-            body = INDEX_HTML.replace("__MODEL_LABEL__", f"{app.args.model} / {app.args.reasoning}").encode("utf-8")
-            self.send_response(HTTPStatus.OK.value)
+        def send_html(self, body_text: str | None = None, status: HTTPStatus = HTTPStatus.OK) -> None:
+            html_text = body_text or INDEX_HTML.replace("__MODEL_LABEL__", f"{app.args.model} / {app.args.reasoning}")
+            body = html_text.encode("utf-8")
+            self.send_response(status.value)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def send_login(self) -> None:
+            self.send_html(LOGIN_HTML.replace("__USERNAME__", html.escape(studio_username(), quote=True)), HTTPStatus.UNAUTHORIZED)
 
         def send_text(self, body_text: str, content_type: str) -> None:
             body = body_text.encode("utf-8")
@@ -1684,10 +1827,24 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
                 return auth[7:].strip()
             return self.headers.get("X-LazyBlog-Token", "").strip()
 
+        def has_studio_cookie(self) -> bool:
+            return verify_studio_cookie(self.headers.get("Cookie", ""))
+
+        def require_studio_auth(self, path: str) -> bool:
+            if not studio_auth_enabled():
+                return True
+            if self.has_studio_cookie():
+                return True
+            if path.startswith("/api/"):
+                self.send_json({"error": "LazyBlog Studio login required", "login_url": "/login"}, HTTPStatus.UNAUTHORIZED)
+                return False
+            self.send_login()
+            return False
+
         def require_api_auth(self, path: str) -> bool:
             if not (path.startswith("/api/codex/") or path.startswith("/api/translate/")):
                 return True
-            if self.client_address[0] in {"127.0.0.1", "::1"}:
+            if path.startswith("/api/codex/") and self.has_studio_cookie():
                 return True
             configured = os.environ.get("LAZYBLOG_API_TOKEN", "").strip()
             if configured:
@@ -1699,10 +1856,32 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
             self.send_json({"error": "set LAZYBLOG_API_TOKEN before exposing Codex APIs beyond loopback"}, HTTPStatus.FORBIDDEN)
             return False
 
+        def authorize_request(self, path: str) -> bool:
+            public_paths = {
+                "/api/health",
+                "/api/login",
+                "/login",
+                "/manifest.webmanifest",
+                "/service-worker.js",
+                "/icons/lazyblog.svg",
+                "/icons/lazyblog-192.png",
+                "/icons/lazyblog-512.png",
+            }
+            if path in public_paths:
+                return True
+            if path.startswith("/api/translate/"):
+                return self.require_api_auth(path)
+            if path.startswith("/api/codex/"):
+                return self.require_api_auth(path)
+            return self.require_studio_auth(path)
+
         def do_GET(self) -> None:  # noqa: N802
             parsed = urllib.parse.urlparse(self.path)
             try:
-                if not self.require_api_auth(parsed.path):
+                if not self.authorize_request(parsed.path):
+                    return
+                if parsed.path == "/login":
+                    self.send_login()
                     return
                 if parsed.path == "/":
                     self.send_html()
@@ -1762,9 +1941,27 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:  # noqa: N802
             parsed = urllib.parse.urlparse(self.path)
             try:
-                if not self.require_api_auth(parsed.path):
-                    return
                 payload = self.read_body()
+                if parsed.path == "/api/login":
+                    username = str(payload.get("username", "")).strip()
+                    token = str(payload.get("token", "")).strip()
+                    if studio_auth_enabled() and username == studio_username() and hmac.compare_digest(token, studio_login_token()):
+                        cookie = (
+                            f"{STUDIO_AUTH_COOKIE}={make_studio_cookie(username)}; "
+                            f"Path=/; HttpOnly; SameSite=Lax; Max-Age={STUDIO_AUTH_TTL_SECONDS}"
+                        )
+                        self.send_json({"user": username}, headers={"Set-Cookie": cookie})
+                        return
+                    self.send_json({"error": "invalid LazyBlog Studio login"}, HTTPStatus.UNAUTHORIZED)
+                    return
+                if parsed.path == "/api/logout":
+                    self.send_json(
+                        {"status": "logged out"},
+                        headers={"Set-Cookie": f"{STUDIO_AUTH_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"},
+                    )
+                    return
+                if not self.authorize_request(parsed.path):
+                    return
                 if parsed.path == "/api/chat":
                     self.send_json(app.reply(str(payload.get("message", "")), payload.get("session_id") or None))
                     return
@@ -1829,6 +2026,7 @@ def main() -> int:
     server = ThreadingHTTPServer((args.host, args.port), make_handler(app))
     print(f"LazyBlog Studio listening on http://{args.host}:{args.port}", flush=True)
     print(f"model={args.model} reasoning={args.reasoning} commit_push={args.commit_push}", flush=True)
+    print(f"studio_auth={'on' if studio_auth_enabled() else 'off'} user={studio_username()}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
