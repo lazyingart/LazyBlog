@@ -1352,6 +1352,8 @@ INDEX_HTML = r"""<!doctype html>
     button:disabled { opacity: 0.55; cursor: wait; transform: none; }
     .secondary { background: rgba(29, 37, 32, 0.08); color: var(--ink); }
     .accent { background: linear-gradient(135deg, var(--clay), var(--gold)); color: #231b12; font-weight: 600; }
+    .publish-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .publish-close { display: none; }
     .field { margin-top: 16px; }
     label { display: block; font-size: 13px; color: var(--muted); margin: 0 0 6px 4px; }
     select, input { width: 100%; border: 1px solid rgba(39, 55, 46, 0.18); border-radius: 16px; background: rgba(255, 255, 255, 0.68); padding: 10px 12px; outline: none; }
@@ -1487,6 +1489,7 @@ INDEX_HTML = r"""<!doctype html>
         box-shadow: 0 22px 60px rgba(22, 30, 25, 0.28);
       }
       .shell.publish-open .publish { display: block; }
+      .publish-close { display: inline-flex; padding: 8px 11px; font-size: 13px; }
       .field { margin-top: 10px; }
       .publish .row { flex-wrap: wrap; gap: 8px; }
       .publish button { padding: 9px 12px; }
@@ -1542,7 +1545,10 @@ INDEX_HTML = r"""<!doctype html>
       </form>
     </section>
     <aside class="panel publish" id="publishPanel">
-      <h2>Publish</h2>
+      <div class="publish-head">
+        <h2>Publish</h2>
+        <button id="publishClose" class="secondary publish-close" type="button" aria-label="Hide publish tools">Hide</button>
+      </div>
       <p class="sub">The publish button creates a draft if needed, converts Markdown to WordPress HTML, creates terms, and posts through REST auth.</p>
       <div class="field">
         <label for="publishStatus">WordPress status</label>
@@ -1915,6 +1921,10 @@ INDEX_HTML = r"""<!doctype html>
     $("publishToggle").addEventListener("click", () => {
       const opened = shell.classList.toggle("publish-open");
       $("publishToggle").setAttribute("aria-expanded", String(opened));
+    });
+    $("publishClose").addEventListener("click", () => {
+      shell.classList.remove("publish-open");
+      $("publishToggle").setAttribute("aria-expanded", "false");
     });
     $("modalRename").addEventListener("click", () => {
       const session = state.modalSession;
