@@ -33,6 +33,9 @@ CHAT_ROOT = ROOT_DIR / "content" / "chat"
 DRAFT_ROOT = ROOT_DIR / "content" / "drafts"
 JOB_ROOT = ROOT_DIR / "content" / "codex-jobs"
 TRANSLATION_JOB_ROOT = ROOT_DIR / "content" / "translation-jobs"
+TAXONOMY_ROOT = ROOT_DIR / "content" / "taxonomy"
+CATEGORY_SNAPSHOT_PATH = TAXONOMY_ROOT / "categories.json"
+POST_PROJECT_ROOT = ROOT_DIR / "content" / "studio-posts"
 CHAT_REPLY_PROMPT = ROOT_DIR / "prompts" / "web-chat-reply.txt"
 CHAT_TASK_PROMPT = ROOT_DIR / "prompts" / "web-draft-task.txt"
 CODEX_RESPONSE_PROMPT = ROOT_DIR / "prompts" / "web-codex-response.txt"
@@ -128,6 +131,12 @@ def safe_session_id(value: str) -> str:
 def safe_job_id(value: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", value):
         raise WebAppError("invalid job id")
+    return value
+
+
+def safe_post_project_id(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", value):
+        raise WebAppError("invalid post project id")
     return value
 
 
@@ -297,6 +306,8 @@ class LazyBlogStudio:
         DRAFT_ROOT.mkdir(parents=True, exist_ok=True)
         JOB_ROOT.mkdir(parents=True, exist_ok=True)
         TRANSLATION_JOB_ROOT.mkdir(parents=True, exist_ok=True)
+        TAXONOMY_ROOT.mkdir(parents=True, exist_ok=True)
+        POST_PROJECT_ROOT.mkdir(parents=True, exist_ok=True)
         self.job_lock = threading.Lock()
 
     def new_session_id(self) -> str:
@@ -495,13 +506,407 @@ Rules:
             )
         return sorted(matches, key=lambda item: item["score"], reverse=True)[:limit]
 
+    def wp_client(self) -> WPClient:
+        load_env_file(ROOT_DIR / ".env")
+        require_auth()
+        return make_client(SimpleNamespace(site_url=None))
+
+    def paginated_wp_get(self, client: WPClient, path: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        page = 1
+        per_page = 100
+        while True:
+            query = dict(params)
+            query["per_page"] = per_page
+            query["page"] = page
+            payload = client.request("GET", f"{path}?{urllib.parse.urlencode(query)}")
+            if not isinstance(payload, list):
+                raise WebAppError(f"unexpected WordPress response for {path}")
+            rows.extend([row for row in payload if isinstance(row, dict)])
+            if len(payload) < per_page:
+                break
+            page += 1
+        return rows
+
+    def normalize_category_record(self, category: dict[str, Any]) -> dict[str, Any]:
+        term_id = int(category.get("term_id") or category.get("id") or 0)
+        return {
+            "term_id": term_id,
+            "slug": str(category.get("slug") or ""),
+            "name": html.unescape(str(category.get("name") or "")),
+            "parent": int(category.get("parent") or 0),
+            "description": str(category.get("description") or ""),
+            "count": int(category.get("count") or 0),
+            "link": str(category.get("link") or ""),
+        }
+
+    def sync_category_mirror(self) -> dict[str, Any]:
+        client = self.wp_client()
+        rows = self.paginated_wp_get(
+            client,
+            "/wp-json/wp/v2/categories",
+            {
+                "hide_empty": "false",
+                "orderby": "id",
+                "order": "asc",
+                "context": "edit",
+            },
+        )
+        categories = [self.normalize_category_record(row) for row in rows]
+        categories = [row for row in categories if int(row.get("term_id") or 0) > 0]
+        categories.sort(key=lambda item: int(item["term_id"]))
+        payload = {
+            "version": 1,
+            "source": client.site_url,
+            "taxonomy": "category",
+            "categories": categories,
+            "synced_at": int(time.time()),
+        }
+        write_json(CATEGORY_SNAPSHOT_PATH, payload)
+        return payload
+
+    def load_category_mirror(self, sync_if_missing: bool = True) -> dict[str, Any]:
+        if not CATEGORY_SNAPSHOT_PATH.exists():
+            if sync_if_missing:
+                return self.sync_category_mirror()
+            return {"version": 1, "taxonomy": "category", "categories": []}
+        try:
+            payload = read_json(CATEGORY_SNAPSHOT_PATH)
+        except json.JSONDecodeError:
+            if sync_if_missing:
+                return self.sync_category_mirror()
+            raise
+        if not isinstance(payload.get("categories"), list):
+            payload["categories"] = []
+        payload["categories"] = [
+            self.normalize_category_record(row)
+            for row in payload.get("categories", [])
+            if isinstance(row, dict) and int(row.get("term_id") or row.get("id") or 0) > 0
+        ]
+        return payload
+
+    def category_records(self, sync_if_missing: bool = True) -> list[dict[str, Any]]:
+        return list(self.load_category_mirror(sync_if_missing=sync_if_missing).get("categories", []))
+
     def category_snapshot(self, limit: int = 40) -> list[str]:
+        try:
+            categories = self.category_records(sync_if_missing=True)
+            names = [str(category.get("name") or "") for category in categories if str(category.get("name") or "")]
+            if names:
+                return names[:limit]
+        except Exception:
+            pass
         counts: dict[str, int] = {}
         for manifest_path in sorted((ROOT_DIR / "content" / "posts").glob("*/lazyblog.json")):
             manifest = read_json(manifest_path, {})
             for category in list_from_value(manifest.get("categories")):
                 counts[category] = counts.get(category, 0) + 1
         return [name for name, _ in sorted(counts.items(), key=lambda item: (-item[1], item[0].lower()))[:limit]]
+
+    def search_categories(self, query: str = "", limit: int = 50, sync: bool = False) -> dict[str, Any]:
+        mirror = self.sync_category_mirror() if sync else self.load_category_mirror(sync_if_missing=True)
+        categories = [self.normalize_category_record(row) for row in mirror.get("categories", []) if isinstance(row, dict)]
+        needle = query.strip().casefold()
+        if needle:
+            categories = [
+                category
+                for category in categories
+                if needle in str(category.get("name") or "").casefold()
+                or needle in str(category.get("slug") or "").casefold()
+                or needle == str(category.get("term_id") or "")
+            ]
+        return {
+            "source": mirror.get("source", ""),
+            "synced_at": mirror.get("synced_at"),
+            "categories": categories[: max(1, min(limit, 200))],
+            "total": len(categories),
+        }
+
+    def find_category_ref(self, ref: Any, sync: bool = True) -> dict[str, Any] | None:
+        if ref is None or ref == "":
+            return None
+        categories = self.category_records(sync_if_missing=sync)
+        if isinstance(ref, dict):
+            ref = ref.get("term_id") or ref.get("id") or ref.get("slug") or ref.get("name")
+        text = str(ref).strip()
+        if not text:
+            return None
+        if text.isdigit():
+            term_id = int(text)
+            return next((category for category in categories if int(category.get("term_id") or 0) == term_id), None)
+        folded = html.unescape(text).casefold()
+        return next(
+            (
+                category
+                for category in categories
+                if str(category.get("slug") or "").casefold() == folded
+                or str(category.get("name") or "").casefold() == folded
+            ),
+            None,
+        )
+
+    def create_category(self, name: str, parent: Any = None, slug: str = "", description: str = "") -> dict[str, Any]:
+        clean_name = " ".join(name.strip().split())
+        if not clean_name:
+            raise WebAppError("category name cannot be empty")
+        parent_record = self.find_category_ref(parent) if parent not in {None, ""} else None
+        parent_id = int(parent_record["term_id"]) if parent_record else 0
+        existing = self.find_category_ref(slug or clean_name)
+        if existing and (parent in {None, ""} or int(existing.get("parent") or 0) == parent_id):
+            return {"category": existing, "created": False, "mirror": self.load_category_mirror(sync_if_missing=True)}
+        client = self.wp_client()
+        payload: dict[str, Any] = {"name": clean_name}
+        if slug.strip():
+            payload["slug"] = slug.strip()
+        if description.strip():
+            payload["description"] = description.strip()
+        if parent_id:
+            payload["parent"] = parent_id
+        try:
+            created = client.request("POST", "/wp-json/wp/v2/categories", payload)
+        except Exception:
+            self.sync_category_mirror()
+            existing = self.find_category_ref(slug or clean_name)
+            if existing and (parent in {None, ""} or int(existing.get("parent") or 0) == parent_id):
+                return {"category": existing, "created": False, "mirror": self.load_category_mirror(sync_if_missing=True)}
+            raise
+        mirror = self.sync_category_mirror()
+        category = self.find_category_ref(created.get("id") or created.get("slug") or clean_name, sync=False) or self.normalize_category_record(created)
+        return {"category": category, "created": True, "mirror": mirror}
+
+    def update_category(self, ref: Any, updates: dict[str, Any]) -> dict[str, Any]:
+        category = self.find_category_ref(ref)
+        if not category:
+            raise WebAppError(f"unknown category: {ref}")
+        allowed: dict[str, Any] = {}
+        for key in ["name", "slug", "description"]:
+            value = str(updates.get(key) or "").strip()
+            if value:
+                allowed[key] = value
+        if "parent" in updates:
+            parent_value = updates.get("parent")
+            if parent_value in {None, "", 0, "0"}:
+                allowed["parent"] = 0
+            else:
+                parent = self.find_category_ref(parent_value)
+                if not parent:
+                    raise WebAppError(f"unknown parent category: {parent_value}")
+                allowed["parent"] = int(parent["term_id"])
+        if not allowed:
+            raise WebAppError("no category updates supplied")
+        client = self.wp_client()
+        updated = client.request("POST", f"/wp-json/wp/v2/categories/{int(category['term_id'])}", allowed)
+        mirror = self.sync_category_mirror()
+        return {"category": self.normalize_category_record(updated), "mirror": mirror}
+
+    def delete_category(self, ref: Any, force: bool = True) -> dict[str, Any]:
+        category = self.find_category_ref(ref)
+        if not category:
+            raise WebAppError(f"unknown category: {ref}")
+        client = self.wp_client()
+        query = urllib.parse.urlencode({"force": "true" if force else "false"})
+        deleted = client.request("DELETE", f"/wp-json/wp/v2/categories/{int(category['term_id'])}?{query}")
+        mirror = self.sync_category_mirror()
+        return {"deleted": deleted, "mirror": mirror}
+
+    def guess_categories_from_text(self, text: str) -> list[str]:
+        lowered = text.casefold()
+        available = {str(category.get("name") or "").casefold(): str(category.get("name") or "") for category in self.category_records()}
+        guessed: list[str] = []
+        if any(word in lowered for word in ["journal", "journals", "diary", "日记", "日誌"]):
+            for name in ["writing", "journals"]:
+                if name in available:
+                    guessed.append(available[name])
+        if any(word in lowered for word in ["wordpress", "docker", "linux", "keyboard", "xrdp", "python", "api"]):
+            for name in ["tech", "technology", "software", "hardware & system", "lazy hacks"]:
+                if name in available and available[name] not in guessed:
+                    guessed.append(available[name])
+                    break
+        return guessed
+
+    def new_post_project_id(self, title: str) -> str:
+        base = slugify(title, "post")[:48].strip("-") or "post"
+        return f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{base}-{uuid.uuid4().hex[:6]}"
+
+    def post_project_dir(self, post_project_id: str) -> Path:
+        return POST_PROJECT_ROOT / safe_post_project_id(post_project_id)
+
+    def post_project_meta_path(self, post_project_id: str) -> Path:
+        return self.post_project_dir(post_project_id) / "post.json"
+
+    def normalize_post_project(self, project: dict[str, Any]) -> dict[str, Any]:
+        project.setdefault("version", 1)
+        project.setdefault("id", "")
+        project.setdefault("title", "Untitled post")
+        project.setdefault("slug", slugify(str(project.get("title") or "post")))
+        project.setdefault("created_at", now_iso())
+        project.setdefault("updated_at", now_iso())
+        project.setdefault("source_language", "en")
+        project["categories"] = list_from_value(project.get("categories"))
+        project["tags"] = list_from_value(project.get("tags"))
+        project["source_sessions"] = list_from_value(project.get("source_sessions"))
+        project.setdefault("current_draft", "")
+        wordpress = project.get("wordpress") if isinstance(project.get("wordpress"), dict) else {}
+        project["wordpress"] = {
+            "post_id": wordpress.get("post_id"),
+            "status": wordpress.get("status") or "local_draft",
+            "link": wordpress.get("link") or "",
+        }
+        return project
+
+    def load_post_project(self, post_project_id: str) -> dict[str, Any]:
+        safe_id = safe_post_project_id(post_project_id)
+        path = self.post_project_meta_path(safe_id)
+        if not path.exists():
+            raise WebAppError(f"unknown post project: {safe_id}")
+        project = self.normalize_post_project(read_json(path))
+        project["id"] = safe_id
+        return project
+
+    def save_post_project(self, project: dict[str, Any]) -> dict[str, Any]:
+        project = self.normalize_post_project(project)
+        project_id = safe_post_project_id(str(project.get("id") or ""))
+        project["id"] = project_id
+        project["updated_at"] = now_iso()
+        write_json(self.post_project_meta_path(project_id), project)
+        return project
+
+    def list_post_projects(self, session_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        safe_session = safe_session_id(session_id) if session_id else None
+        active_id = ""
+        if safe_session:
+            try:
+                active_id = str(self.load_session(safe_session).get("active_post_project_id") or "")
+            except WebAppError:
+                active_id = ""
+        projects: list[dict[str, Any]] = []
+        for path in POST_PROJECT_ROOT.glob("*/post.json"):
+            try:
+                project = self.normalize_post_project(read_json(path))
+                project["id"] = path.parent.name
+            except (json.JSONDecodeError, WebAppError, OSError):
+                continue
+            project["active"] = bool(active_id and project["id"] == active_id)
+            project["from_current_session"] = bool(safe_session and safe_session in project.get("source_sessions", []))
+            projects.append(project)
+        active_rows = [item for item in projects if item.get("active")]
+        session_rows = [item for item in projects if not item.get("active") and item.get("from_current_session")]
+        other_rows = [item for item in projects if not item.get("active") and not item.get("from_current_session")]
+        other_rows.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+        session_rows.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+        return [*active_rows, *session_rows, *other_rows][: max(1, min(limit, 500))]
+
+    def current_draft_path_for_project(self, project: dict[str, Any]) -> Path | None:
+        current = str(project.get("current_draft") or "").strip()
+        project_dir = self.post_project_dir(str(project["id"])).resolve()
+        candidates: list[Path] = []
+        if current:
+            candidates.extend([(project_dir / current).resolve(), (ROOT_DIR / current).resolve()])
+        candidates.extend(sorted((project_dir / "drafts").glob("*.md"), reverse=True))
+        for path in candidates:
+            try:
+                resolved = path.resolve()
+            except OSError:
+                continue
+            if resolved.exists() and (project_dir == resolved.parent or project_dir in resolved.parents):
+                return resolved
+        return None
+
+    def post_project_payload(self, post_project_id: str) -> dict[str, Any]:
+        project = self.load_post_project(post_project_id)
+        draft_path = self.current_draft_path_for_project(project)
+        draft = None
+        if draft_path:
+            draft = {
+                "path": str(draft_path.relative_to(ROOT_DIR)),
+                "markdown": draft_path.read_text(encoding="utf-8"),
+            }
+        return {"post_project": project, "draft": draft}
+
+    def set_active_post_project(self, session_id: str, post_project_id: str) -> dict[str, Any]:
+        safe_session = safe_session_id(session_id)
+        if not str(post_project_id or "").strip():
+            session = self.load_session(safe_session)
+            session["active_post_project_id"] = ""
+            self.save_session(safe_session, session)
+            return self.session_payload(safe_session)
+        project = self.load_post_project(post_project_id)
+        sessions = list_from_value(project.get("source_sessions"))
+        if safe_session not in sessions:
+            sessions.append(safe_session)
+            project["source_sessions"] = sessions
+            self.save_post_project(project)
+        session = self.load_session(safe_session)
+        session["active_post_project_id"] = project["id"]
+        draft_path = self.current_draft_path_for_project(project)
+        if draft_path:
+            session["latest_draft"] = str(draft_path.relative_to(ROOT_DIR))
+        self.save_session(safe_session, session)
+        return self.session_payload(safe_session)
+
+    def create_post_project(
+        self,
+        session_id: str | None = None,
+        title: str = "",
+        instruction: str = "",
+        categories: list[str] | None = None,
+        source_language: str = "en",
+    ) -> dict[str, Any]:
+        safe_session = safe_session_id(session_id) if session_id else None
+        seed_text = instruction.strip()
+        session_title = ""
+        if safe_session:
+            session = self.load_session(safe_session)
+            session_title = str(session.get("title") or "")
+            seed_text = (seed_text + "\n" + self.transcript(safe_session, limit=36)).strip()
+        clean_title = " ".join((title or "").strip().split())
+        if not clean_title:
+            clean_title = session_title if session_title and session_title != "Untitled chat" else ""
+        if not clean_title:
+            clean_title = "Today's Journal" if "journal" in seed_text.casefold() else "Untitled post"
+        post_project_id = self.new_post_project_id(clean_title)
+        project_categories = categories or self.guess_categories_from_text(seed_text)
+        project = {
+            "version": 1,
+            "id": post_project_id,
+            "title": clean_title[:160],
+            "slug": slugify(clean_title, "post"),
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+            "source_language": source_language if source_language in {"en", "ja", "zh"} else "en",
+            "categories": project_categories,
+            "tags": [],
+            "source_sessions": [safe_session] if safe_session else [],
+            "current_draft": "",
+            "wordpress": {"post_id": None, "status": "local_draft", "link": ""},
+        }
+        self.save_post_project(project)
+        if safe_session:
+            session = self.load_session(safe_session)
+            session["active_post_project_id"] = post_project_id
+            self.save_session(safe_session, session)
+        try:
+            git_commit_push(
+                [self.post_project_dir(post_project_id)],
+                f"Create LazyBlog Studio post {post_project_id}",
+                self.args.branch,
+                self.args.commit_push,
+            )
+        except subprocess.CalledProcessError:
+            pass
+        return self.post_project_payload(post_project_id)
+
+    def active_post_project_id(self, session_id: str) -> str:
+        session = self.load_session(safe_session_id(session_id))
+        active_id = str(session.get("active_post_project_id") or "")
+        if active_id:
+            try:
+                self.load_post_project(active_id)
+                return active_id
+            except WebAppError:
+                session["active_post_project_id"] = ""
+                self.save_session(session_id, session)
+        return ""
 
     def new_job_id(self, tool_name: str) -> str:
         return f"{stamp()}-{uuid.uuid4().hex[:8]}-{slugify(tool_name, 'codex')}"
@@ -1032,6 +1437,19 @@ Rules:
             "transcript": self.transcript(session_id),
             "local_matches": local_matches,
             "category_snapshot": self.category_snapshot(),
+            "control_surface": {
+                "chat_rule": "Send & Store only records chat memory and replies. It must not claim a WordPress/category action has been completed.",
+                "managed_objects": ["ChatSession", "PostProject", "WordPressPost", "CategoryMirror"],
+                "available_controlled_actions": [
+                    "POST /api/posts creates a local post project",
+                    "POST /api/post/draft drafts or revises the selected post project",
+                    "POST /api/post/publish publishes or updates the selected WordPress post",
+                    "POST /api/category creates a category",
+                    "POST /api/category/update updates a category",
+                    "POST /api/category/delete deletes a category",
+                    "POST /api/categories/sync refreshes the local category mirror",
+                ],
+            },
             "storage": {
                 "session_dir": str(self.session_dir(session_id).relative_to(ROOT_DIR)),
                 "user_message_path": str(user_path.relative_to(ROOT_DIR)),
@@ -1149,6 +1567,151 @@ Rules:
             "markdown": draft_path.read_text(encoding="utf-8"),
         }
 
+    def markdown_post_metadata(self, markdown: str, fallback_title: str = "Untitled post") -> dict[str, Any]:
+        front_matter, body = split_front_matter(markdown)
+        title = front_matter.get("title") or first_heading(body) or fallback_title
+        return {
+            "title": title,
+            "slug": front_matter.get("slug") or slugify(title, "post"),
+            "source_language": front_matter.get("source_language") or front_matter.get("language") or "en",
+            "excerpt": front_matter.get("excerpt") or "",
+            "categories": front_matter_list(markdown, "categories") or list_from_value(front_matter.get("categories")),
+            "tags": front_matter_list(markdown, "tags") or list_from_value(front_matter.get("tags")),
+        }
+
+    def ensure_active_post_project(self, session_id: str, instruction: str = "") -> str:
+        active_id = self.active_post_project_id(session_id)
+        if active_id:
+            return active_id
+        payload = self.create_post_project(session_id=session_id, instruction=instruction)
+        return str(payload["post_project"]["id"])
+
+    def draft_post_project(
+        self,
+        post_project_id: str | None,
+        session_id: str,
+        instruction: str = "",
+        status: str = "draft",
+    ) -> dict[str, Any]:
+        status = status if status in {"draft", "publish", "private"} else "draft"
+        session_id = safe_session_id(session_id)
+        resolved_post_project_id = safe_post_project_id(post_project_id) if post_project_id else self.ensure_active_post_project(session_id, instruction)
+        project = self.load_post_project(resolved_post_project_id)
+        sessions = list_from_value(project.get("source_sessions"))
+        if session_id not in sessions:
+            sessions.append(session_id)
+            project["source_sessions"] = sessions
+            self.save_post_project(project)
+        self.set_active_post_project(session_id, resolved_post_project_id)
+
+        current_draft_path = self.current_draft_path_for_project(project)
+        current_draft = current_draft_path.read_text(encoding="utf-8") if current_draft_path else ""
+        session = self.load_session(session_id)
+        transcript = self.transcript(session_id, limit=36)
+        local_matches = self.search_local_content(transcript + "\n" + current_draft + "\n" + instruction, limit=10)
+        payload = {
+            "session": session,
+            "post_project": project,
+            "instruction": instruction,
+            "requested_status": status,
+            "transcript": transcript,
+            "current_draft": current_draft,
+            "local_matches": local_matches,
+            "category_snapshot": self.category_snapshot(),
+            "category_mirror": self.search_categories(limit=120).get("categories", []),
+            "control_surface": {
+                "allowed_actions": [
+                    "draft selected post project",
+                    "revise selected post project",
+                    "publish selected post project as draft/publish/private",
+                    "create/update/delete category through taxonomy API only",
+                ],
+                "rule": "Chat is context only. PostProject is the managed article object.",
+            },
+            "storage": {
+                "session_dir": str(self.session_dir(session_id).relative_to(ROOT_DIR)),
+                "post_project_dir": str(self.post_project_dir(resolved_post_project_id).relative_to(ROOT_DIR)),
+                "draft_dir": str((self.post_project_dir(resolved_post_project_id) / "drafts").relative_to(ROOT_DIR)),
+            },
+        }
+        result = self.run_codex_tool(
+            session_id=session_id,
+            tool_name="task",
+            prompt_template_path=CHAT_TASK_PROMPT,
+            schema_path=CHAT_TASK_SCHEMA,
+            payload=payload,
+        )
+        draft = result["draft"]
+        slug = slugify(draft.get("slug") or draft.get("title") or project.get("slug") or resolved_post_project_id, fallback=resolved_post_project_id)
+        draft_dir = self.post_project_dir(resolved_post_project_id) / "drafts"
+        draft_path = draft_dir / f"{stamp()}-{slug}.md"
+        markdown = str(draft.get("markdown") or "").strip()
+        front_matter = self.draft_front_matter(draft, status=status)
+        if not front_matter["categories"] and project.get("categories"):
+            front_matter["categories"] = list_from_value(project.get("categories"))
+        if not front_matter["tags"] and project.get("tags"):
+            front_matter["tags"] = list_from_value(project.get("tags"))
+        write_markdown(draft_path, front_matter, markdown)
+        metadata = self.markdown_post_metadata(draft_path.read_text(encoding="utf-8"), fallback_title=str(project.get("title") or "Untitled post"))
+        project.update(
+            {
+                "title": metadata["title"],
+                "slug": metadata["slug"],
+                "source_language": metadata["source_language"] if metadata["source_language"] in {"en", "ja", "zh"} else "en",
+                "categories": metadata["categories"] or list_from_value(project.get("categories")),
+                "tags": metadata["tags"] or list_from_value(project.get("tags")),
+                "current_draft": str(draft_path.relative_to(self.post_project_dir(resolved_post_project_id))),
+            }
+        )
+        self.save_post_project(project)
+        draft_manifest = {
+            "post_project_id": resolved_post_project_id,
+            "session_id": session_id,
+            "created_at": now_iso(),
+            "draft_path": str(draft_path.relative_to(ROOT_DIR)),
+            "title": metadata["title"],
+            "slug": metadata["slug"],
+            "source_language": metadata["source_language"],
+            "categories": metadata["categories"],
+            "tags": metadata["tags"],
+            "codex": {
+                "model": self.args.model,
+                "reasoning": self.args.reasoning,
+                "reply": result.get("reply", ""),
+                "action": result.get("action", ""),
+                "needs_review": result.get("needs_review", False),
+                "notes": result.get("notes", []),
+                "research_queries": result.get("research_queries", []),
+                "research_sources": result.get("research_sources", []),
+                "local_matches_used": result.get("local_matches_used", []),
+            },
+        }
+        write_json(draft_path.with_suffix(".json"), draft_manifest)
+        session = self.load_session(session_id)
+        session["active_post_project_id"] = resolved_post_project_id
+        session["latest_draft"] = str(draft_path.relative_to(ROOT_DIR))
+        self.save_session(session_id, session)
+        warnings: list[str] = []
+        try:
+            git_commit_push(
+                [self.post_project_dir(resolved_post_project_id), self.session_dir(session_id)],
+                f"Draft LazyBlog Studio post {resolved_post_project_id}",
+                self.args.branch,
+                self.args.commit_push,
+            )
+        except subprocess.CalledProcessError as exc:
+            warnings.append(f"git commit/push failed: {exc}")
+        payload = {
+            **self.session_payload(session_id),
+            **self.post_project_payload(resolved_post_project_id),
+            "task": result,
+            "draft_path": str(draft_path.relative_to(ROOT_DIR)),
+            "manifest_path": str(draft_path.with_suffix(".json").relative_to(ROOT_DIR)),
+            "markdown": draft_path.read_text(encoding="utf-8"),
+            "warnings": warnings,
+        }
+        return payload
+
     def resolve_terms(self, client: WPClient, endpoint: str, names: list[str]) -> tuple[list[int], list[str]]:
         ids: list[int] = []
         warnings: list[str] = []
@@ -1250,6 +1813,141 @@ Rules:
             "published": published,
         }
 
+    def publish_post_project(
+        self,
+        post_project_id: str | None,
+        session_id: str,
+        status: str = "draft",
+        force_redraft: bool = False,
+        instruction: str = "",
+        update_existing: bool = True,
+    ) -> dict[str, Any]:
+        status = status if status in {"draft", "publish", "private"} else "draft"
+        session_id = safe_session_id(session_id)
+        resolved_post_project_id = safe_post_project_id(post_project_id) if post_project_id else self.ensure_active_post_project(session_id, instruction)
+        redraft: dict[str, Any] | None = None
+        project = self.load_post_project(resolved_post_project_id)
+        draft_path = None if force_redraft else self.current_draft_path_for_project(project)
+        if draft_path is None:
+            redraft = self.draft_post_project(resolved_post_project_id, session_id, instruction=instruction, status=status)
+            project = self.load_post_project(resolved_post_project_id)
+            draft_path = self.current_draft_path_for_project(project)
+        if draft_path is None:
+            raise WebAppError("failed to create a draft for the selected post")
+
+        client = self.wp_client()
+        markdown = draft_path.read_text(encoding="utf-8")
+        metadata = self.markdown_post_metadata(markdown, fallback_title=str(project.get("title") or draft_path.stem))
+        categories = metadata["categories"] or list_from_value(project.get("categories"))
+        tags = metadata["tags"] or list_from_value(project.get("tags"))
+        category_ids, category_warnings = self.resolve_terms(client, "categories", categories)
+        tag_ids, tag_warnings = self.resolve_terms(client, "tags", tags)
+        payload: dict[str, Any] = {
+            "title": metadata["title"],
+            "content": markdown_to_html(markdown),
+            "status": status,
+            "slug": metadata["slug"],
+        }
+        if metadata.get("excerpt"):
+            payload["excerpt"] = metadata["excerpt"]
+        if category_ids:
+            payload["categories"] = category_ids
+        if tag_ids:
+            payload["tags"] = tag_ids
+
+        wordpress = project.get("wordpress") if isinstance(project.get("wordpress"), dict) else {}
+        existing_id = wordpress.get("post_id")
+        if update_existing and existing_id:
+            post = client.update_post(int(existing_id), payload)
+            action = "updated"
+        else:
+            post = client.request("POST", "/wp-json/wp/v2/posts", payload)
+            action = "created"
+
+        source_warning = ""
+        try:
+            client.set_source_language(int(post["id"]), str(metadata["source_language"] or project.get("source_language") or "en"))
+        except Exception as exc:  # noqa: BLE001
+            source_warning = f"post saved, but source language meta was not set: {exc}"
+
+        project.update(
+            {
+                "title": metadata["title"],
+                "slug": metadata["slug"],
+                "source_language": metadata["source_language"] if metadata["source_language"] in {"en", "ja", "zh"} else "en",
+                "categories": categories,
+                "tags": tags,
+                "wordpress": {
+                    "post_id": post.get("id"),
+                    "status": status,
+                    "link": post.get("link") or "",
+                },
+            }
+        )
+        self.save_post_project(project)
+        try:
+            self.sync_category_mirror()
+        except Exception:
+            pass
+
+        published = {
+            "post_project_id": resolved_post_project_id,
+            "session_id": session_id,
+            "draft_path": str(draft_path.relative_to(ROOT_DIR)),
+            "published_at": now_iso(),
+            "action": action,
+            "status": status,
+            "post_id": post.get("id"),
+            "link": post.get("link"),
+            "source_language": metadata["source_language"],
+            "warnings": [*category_warnings, *tag_warnings, *([source_warning] if source_warning else [])],
+        }
+        event_dir = self.post_project_dir(resolved_post_project_id) / "publish-events"
+        event_path = event_dir / f"{stamp()}-{post.get('id')}.json"
+        write_json(event_path, published)
+        session = self.load_session(session_id)
+        session["active_post_project_id"] = resolved_post_project_id
+        session.setdefault("published", []).append(published)
+        self.save_session(session_id, session)
+        try:
+            git_commit_push(
+                [self.post_project_dir(resolved_post_project_id), self.session_dir(session_id), CATEGORY_SNAPSHOT_PATH],
+                f"Publish LazyBlog Studio post {post.get('id')}",
+                self.args.branch,
+                self.args.commit_push,
+            )
+        except subprocess.CalledProcessError as exc:
+            published.setdefault("warnings", []).append(f"git commit/push failed: {exc}")
+            write_json(event_path, published)
+        return {
+            **self.session_payload(session_id),
+            **self.post_project_payload(resolved_post_project_id),
+            "redraft": redraft,
+            "published": published,
+        }
+
+    def link_post_project(self, post_project_id: str, post_id: Any, status: str = "", link: str = "") -> dict[str, Any]:
+        project = self.load_post_project(post_project_id)
+        if not str(post_id).strip().isdigit():
+            raise WebAppError("post_id must be numeric")
+        resolved_post_id = int(str(post_id).strip())
+        resolved_status = status.strip() if status.strip() in {"draft", "publish", "private", "pending", "future"} else ""
+        resolved_link = link.strip()
+        if not resolved_link or not resolved_status:
+            try:
+                post = self.wp_client().get_post(resolved_post_id)
+                resolved_link = resolved_link or str(post.get("link") or "")
+                resolved_status = resolved_status or str(post.get("status") or "draft")
+            except Exception:
+                resolved_status = resolved_status or "draft"
+        project["wordpress"] = {
+            "post_id": resolved_post_id,
+            "status": resolved_status,
+            "link": resolved_link,
+        }
+        self.save_post_project(project)
+        return self.post_project_payload(str(project["id"]))
+
     def session_payload(self, session_id: str, limit: int = DEFAULT_MESSAGE_BATCH_SIZE, before: str = "") -> dict[str, Any]:
         session = self.load_session(safe_session_id(session_id))
         page = self.message_page(session_id, limit=limit, before=before)
@@ -1260,7 +1958,22 @@ Rules:
                 "path": str(draft_path.relative_to(ROOT_DIR)),
                 "markdown": draft_path.read_text(encoding="utf-8"),
             }
-        return {"session": session, "messages": page["messages"], "message_page": page["message_page"], "draft": draft}
+        active_post = None
+        active_id = str(session.get("active_post_project_id") or "")
+        if active_id:
+            try:
+                active_post = self.post_project_payload(active_id)
+                if active_post.get("draft"):
+                    draft = active_post["draft"]
+            except WebAppError:
+                active_post = None
+        return {
+            "session": session,
+            "messages": page["messages"],
+            "message_page": page["message_page"],
+            "draft": draft,
+            "active_post_project": active_post,
+        }
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -1360,6 +2073,11 @@ INDEX_HTML = r"""<!doctype html>
     .preview { height: 360px; min-height: 220px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; background: #18251f; color: #eef6ec; border-color: rgba(255, 255, 255, 0.08); }
     .log { margin-top: 12px; padding: 12px; border-radius: 16px; background: rgba(255, 255, 255, 0.56); color: var(--muted); font-size: 13px; line-height: 1.4; white-space: pre-wrap; min-height: 44px; }
     .path { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color: var(--teal-dark); overflow-wrap: anywhere; }
+    .post-meta strong { color: var(--ink); }
+    .post-meta a { color: var(--teal-dark); overflow-wrap: anywhere; }
+    .category-hits { display: grid; gap: 6px; }
+    .category-hit { display: flex; justify-content: space-between; gap: 8px; border-bottom: 1px solid rgba(39, 55, 46, 0.1); padding-bottom: 5px; }
+    .category-hit:last-child { border-bottom: 0; padding-bottom: 0; }
     .monitor-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 22px; }
     .job-list { display: grid; gap: 9px; margin-top: 12px; }
     .job-card { border: 1px solid var(--line); border-radius: 16px; padding: 10px; background: rgba(255, 255, 255, 0.52); cursor: pointer; }
@@ -1549,7 +2267,18 @@ INDEX_HTML = r"""<!doctype html>
         <h2>Publish</h2>
         <button id="publishClose" class="secondary publish-close" type="button" aria-label="Hide publish tools">Hide</button>
       </div>
-      <p class="sub">The publish button creates a draft if needed, converts Markdown to WordPress HTML, creates terms, and posts through REST auth.</p>
+      <p class="sub">Chat is memory. Posts are independent local projects that can be drafted, selected, published, or updated through controlled APIs.</p>
+      <div class="field">
+        <label for="postProjectSelect">Selected post project</label>
+        <select id="postProjectSelect">
+          <option value="">No post project selected</option>
+        </select>
+      </div>
+      <div class="row">
+        <button id="newPostProjectButton" class="secondary" type="button">New Post</button>
+        <button id="refreshPostProjects" class="secondary" type="button">Refresh Posts</button>
+      </div>
+      <div id="postProjectMeta" class="log post-meta">No post selected. Draft Post will create one from the current chat.</div>
       <div class="field">
         <label for="publishStatus">WordPress status</label>
         <select id="publishStatus">
@@ -1560,10 +2289,10 @@ INDEX_HTML = r"""<!doctype html>
       </div>
       <div class="field">
         <label for="extraInstruction">Extra instruction for the task tool</label>
-        <input id="extraInstruction" placeholder="e.g. make it reflective, English, category Notes">
+        <input id="extraInstruction" placeholder="e.g. make this a journal, category Journals, keep it reflective">
       </div>
       <div class="row">
-        <button id="publishButton" class="accent" type="button">Draft and Publish</button>
+        <button id="publishButton" class="accent" type="button">Publish Selected</button>
         <button id="redraftButton" class="secondary" type="button">Force Redraft</button>
       </div>
       <div class="field">
@@ -1571,6 +2300,19 @@ INDEX_HTML = r"""<!doctype html>
         <textarea id="draftPreview" class="preview" readonly></textarea>
       </div>
       <div id="publishLog" class="log">No draft yet.</div>
+      <div class="monitor-head">
+        <h2>Categories</h2>
+        <button id="syncCategories" class="secondary" type="button">Sync</button>
+      </div>
+      <p class="sub">Category actions use the synced WordPress taxonomy mirror instead of guessing from old local manifests.</p>
+      <div class="field">
+        <label for="categorySearch">Search category mirror</label>
+        <input id="categorySearch" placeholder="Writing, Journals, Hardware...">
+      </div>
+      <div class="row">
+        <button id="searchCategories" class="secondary" type="button">Search</button>
+      </div>
+      <div id="categoryLog" class="log">Category mirror is loaded on demand.</div>
       <div class="monitor-head">
         <h2>Codex Monitor</h2>
         <button id="refreshJobs" class="secondary" type="button">Poll</button>
@@ -1592,7 +2334,15 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </div>
   <script>
-    const state = { sessionId: null, busy: false, messagePage: null, loadingMore: false, modalSession: null };
+    const state = {
+      sessionId: null,
+      busy: false,
+      messagePage: null,
+      loadingMore: false,
+      modalSession: null,
+      postProjects: [],
+      activePostId: ""
+    };
     const $ = (id) => document.getElementById(id);
     const shell = $("shell");
     $("modelLabel").textContent = "__MODEL_LABEL__";
@@ -1638,6 +2388,7 @@ INDEX_HTML = r"""<!doctype html>
     function clearChat() {
       state.sessionId = null;
       state.messagePage = null;
+      state.activePostId = "";
       $("chatTitle").textContent = "New chat";
       $("chatMeta").textContent = "Messages will be saved as Markdown.";
       $("messageList").innerHTML = "";
@@ -1645,6 +2396,7 @@ INDEX_HTML = r"""<!doctype html>
       updateMoreButton();
       $("draftPreview").value = "";
       $("publishLog").textContent = "No draft yet.";
+      renderPostProjects([], "");
     }
 
     function updateMoreButton() {
@@ -1714,6 +2466,110 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
 
+    function projectLabel(project) {
+      const wp = project.wordpress || {};
+      const status = wp.post_id ? `${wp.status || "wp"} #${wp.post_id}` : "local";
+      return `${project.title || project.id} · ${status}`;
+    }
+
+    function renderPostProjects(projects, activeId) {
+      state.postProjects = projects || [];
+      state.activePostId = activeId || "";
+      const select = $("postProjectSelect");
+      select.innerHTML = `<option value="">Auto new post from this chat</option>`;
+      for (const project of state.postProjects) {
+        const option = document.createElement("option");
+        option.value = project.id;
+        option.textContent = projectLabel(project);
+        if (project.id === state.activePostId) option.selected = true;
+        select.appendChild(option);
+      }
+      const selected = state.postProjects.find((project) => project.id === state.activePostId);
+      renderPostProjectMeta(selected);
+    }
+
+    function renderPostProjectMeta(project) {
+      if (!project) {
+        $("postProjectMeta").textContent = "No post selected. Draft Post will create one from the current chat.";
+        return;
+      }
+      const wp = project.wordpress || {};
+      const categories = (project.categories || []).join(", ") || "No category yet";
+      const source = (project.source_sessions || []).length ? `${project.source_sessions.length} chat source(s)` : "No chat source";
+      const link = wp.link ? `<br><a href="${escapeHtml(wp.link)}" target="_blank" rel="noreferrer">${escapeHtml(wp.link)}</a>` : "";
+      $("postProjectMeta").innerHTML = `<strong>${escapeHtml(project.title || project.id)}</strong><br>${escapeHtml(source)} · ${escapeHtml(categories)}<br>${escapeHtml(wp.post_id ? `WordPress ${wp.status || "saved"} #${wp.post_id}` : "Local draft only")}${link}`;
+    }
+
+    async function loadPostProjects() {
+      const suffix = state.sessionId ? `?session_id=${encodeURIComponent(state.sessionId)}&limit=100` : "?limit=100";
+      const data = await api(`/api/posts${suffix}`);
+      const active = data.active_post_project && data.active_post_project.post_project ? data.active_post_project.post_project.id : (data.active_post_project_id || "");
+      renderPostProjects(data.post_projects || [], active || "");
+      if (data.active_post_project && data.active_post_project.draft) {
+        $("draftPreview").value = data.active_post_project.draft.markdown || "";
+        $("publishLog").innerHTML = `Selected draft: <span class="path">${escapeHtml(data.active_post_project.draft.path)}</span>`;
+      }
+    }
+
+    async function selectPostProject(id) {
+      if (!state.sessionId) {
+        state.activePostId = id || "";
+        renderPostProjectMeta(state.postProjects.find((project) => project.id === id));
+        return;
+      }
+      if (!id) {
+        const data = await api("/api/post/select", { session_id: state.sessionId, post_project_id: "" });
+        state.activePostId = "";
+        renderSession(data);
+        $("draftPreview").value = "";
+        $("publishLog").textContent = "No post selected. Draft Post will create one from this chat.";
+        return;
+      }
+      const data = await api("/api/post/select", { session_id: state.sessionId, post_project_id: id });
+      renderSession(data);
+    }
+
+    async function newPostProject() {
+      if (!state.sessionId) {
+        $("publishLog").textContent = "Send at least one message first.";
+        return;
+      }
+      setBusy("creating post project...");
+      try {
+        const data = await api("/api/posts", {
+          session_id: state.sessionId,
+          instruction: $("extraInstruction").value
+        });
+        state.activePostId = data.post_project.id;
+        $("publishLog").innerHTML = `Post project created: <span class="path">${escapeHtml(data.post_project.id)}</span>`;
+        await loadPostProjects();
+      } catch (err) {
+        $("publishLog").textContent = err.message;
+      } finally {
+        setBusy("");
+      }
+    }
+
+    function renderCategories(data) {
+      const categories = data.categories || [];
+      if (!categories.length) {
+        $("categoryLog").textContent = "No categories matched.";
+        return;
+      }
+      $("categoryLog").innerHTML = `<div class="category-hits">${categories.slice(0, 12).map((item) => `
+        <div class="category-hit"><span>${escapeHtml(item.name || item.slug)}</span><span>#${escapeHtml(item.term_id || "")} · ${escapeHtml(item.slug || "")}</span></div>
+      `).join("")}</div>`;
+    }
+
+    async function loadCategories(sync = false) {
+      const query = $("categorySearch").value.trim();
+      const params = new URLSearchParams({ limit: "80" });
+      if (query) params.set("search", query);
+      if (sync) params.set("sync", "1");
+      const data = await api(`/api/categories?${params.toString()}`);
+      renderCategories(data);
+    }
+
     function renderMessages(messages) {
       const root = $("messageList");
       root.innerHTML = "";
@@ -1751,7 +2607,12 @@ INDEX_HTML = r"""<!doctype html>
         $("draftPreview").value = payload.draft.markdown || "";
         $("publishLog").innerHTML = `Latest draft: <span class="path">${escapeHtml(payload.draft.path)}</span>`;
       }
+      if (payload.active_post_project && payload.active_post_project.post_project) {
+        state.activePostId = payload.active_post_project.post_project.id;
+        renderPostProjectMeta(payload.active_post_project.post_project);
+      }
       loadSessions();
+      loadPostProjects().catch((err) => { $("publishLog").textContent = err.message; });
       loadJobs();
     }
 
@@ -1856,13 +2717,16 @@ INDEX_HTML = r"""<!doctype html>
       }
       setBusy("running task tool...");
       try {
-        const data = await api("/api/draft", {
+        const data = await api("/api/post/draft", {
           session_id: state.sessionId,
+          post_project_id: state.activePostId || "",
           status: $("publishStatus").value,
           instruction: $("extraInstruction").value
         });
         $("draftPreview").value = data.markdown || "";
-        $("publishLog").innerHTML = `Draft saved: <span class="path">${escapeHtml(data.draft_path)}</span>`;
+        const project = data.post_project || {};
+        state.activePostId = project.id || state.activePostId;
+        $("publishLog").innerHTML = `Draft saved for ${escapeHtml(project.title || "selected post")}: <span class="path">${escapeHtml(data.draft_path)}</span>`;
         renderSession(data);
       } catch (err) {
         $("publishLog").textContent = err.message;
@@ -1878,14 +2742,17 @@ INDEX_HTML = r"""<!doctype html>
       }
       setBusy(force ? "redrafting and publishing..." : "publishing...");
       try {
-        const data = await api("/api/publish", {
+        const data = await api("/api/post/publish", {
           session_id: state.sessionId,
+          post_project_id: state.activePostId || "",
           status: $("publishStatus").value,
           force_redraft: Boolean(force),
-          instruction: $("extraInstruction").value
+          instruction: $("extraInstruction").value,
+          update_existing: true
         });
         const link = data.published.link || "";
-        $("publishLog").innerHTML = `WordPress post ${data.published.post_id} saved as ${data.published.status}.<br><span class="path">${escapeHtml(link)}</span>`;
+        const action = data.published.action === "updated" ? "updated" : "created";
+        $("publishLog").innerHTML = `WordPress post ${data.published.post_id} ${action} as ${data.published.status}.<br><span class="path">${escapeHtml(link)}</span>`;
         renderSession(data);
       } catch (err) {
         $("publishLog").textContent = err.message;
@@ -1896,6 +2763,19 @@ INDEX_HTML = r"""<!doctype html>
 
     $("composer").addEventListener("submit", sendMessage);
     $("draftButton").addEventListener("click", draftPost);
+    $("postProjectSelect").addEventListener("change", (event) => {
+      selectPostProject(event.target.value).catch((err) => { $("publishLog").textContent = err.message; });
+    });
+    $("newPostProjectButton").addEventListener("click", newPostProject);
+    $("refreshPostProjects").addEventListener("click", () => loadPostProjects().catch((err) => { $("publishLog").textContent = err.message; }));
+    $("syncCategories").addEventListener("click", () => loadCategories(true).catch((err) => { $("categoryLog").textContent = err.message; }));
+    $("searchCategories").addEventListener("click", () => loadCategories(false).catch((err) => { $("categoryLog").textContent = err.message; }));
+    $("categorySearch").addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        loadCategories(false).catch((err) => { $("categoryLog").textContent = err.message; });
+      }
+    });
     $("moreMessages").addEventListener("click", loadMoreMessages);
     $("messages").addEventListener("scroll", () => {
       const button = $("moreMessages");
@@ -1953,6 +2833,7 @@ INDEX_HTML = r"""<!doctype html>
       $("mobileMenuToggle").setAttribute("aria-expanded", "false");
       clearChat();
       loadSessions();
+      loadPostProjects().catch(() => {});
     });
     if ("serviceWorker" in navigator) {
       window.addEventListener("load", () => {
@@ -1960,6 +2841,8 @@ INDEX_HTML = r"""<!doctype html>
       });
     }
     loadSessions({ autoload: true }).catch((err) => { $("publishLog").textContent = err.message; });
+    loadPostProjects().catch(() => {});
+    loadCategories(false).catch(() => {});
     loadJobs().catch(() => {});
     setInterval(() => loadJobs().catch(() => {}), 4000);
   </script>
@@ -2351,6 +3234,32 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
                     before = params.get("before", [""])[0]
                     self.send_json(app.message_page(session_id, limit=int(raw_limit), before=before))
                     return
+                if parsed.path == "/api/categories":
+                    params = urllib.parse.parse_qs(parsed.query)
+                    query = params.get("search", [""])[0]
+                    raw_limit = params.get("limit", ["50"])[0]
+                    sync = params.get("sync", ["0"])[0].lower() in {"1", "true", "yes", "on"}
+                    self.send_json(app.search_categories(query=query, limit=int(raw_limit), sync=sync))
+                    return
+                if parsed.path == "/api/posts":
+                    params = urllib.parse.parse_qs(parsed.query)
+                    session_id = params.get("session_id", [None])[0]
+                    raw_limit = params.get("limit", ["100"])[0]
+                    active_id = app.active_post_project_id(session_id) if session_id else ""
+                    active_post = app.post_project_payload(active_id) if active_id else None
+                    self.send_json(
+                        {
+                            "post_projects": app.list_post_projects(session_id=session_id, limit=int(raw_limit)),
+                            "active_post_project_id": active_id,
+                            "active_post_project": active_post,
+                        }
+                    )
+                    return
+                if parsed.path == "/api/post":
+                    params = urllib.parse.parse_qs(parsed.query)
+                    post_project_id = params.get("id", [""])[0]
+                    self.send_json(app.post_project_payload(post_project_id))
+                    return
                 if parsed.path == "/api/codex/jobs":
                     params = urllib.parse.parse_qs(parsed.query)
                     raw_limit = params.get("limit", ["20"])[0]
@@ -2412,6 +3321,71 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
                     return
                 if parsed.path == "/api/chat":
                     self.send_json(app.reply(str(payload.get("message", "")), payload.get("session_id") or None))
+                    return
+                if parsed.path == "/api/categories/sync":
+                    self.send_json(app.sync_category_mirror())
+                    return
+                if parsed.path == "/api/category":
+                    self.send_json(
+                        app.create_category(
+                            str(payload.get("name", "")),
+                            parent=payload.get("parent"),
+                            slug=str(payload.get("slug", "")),
+                            description=str(payload.get("description", "")),
+                        )
+                    )
+                    return
+                if parsed.path == "/api/category/update":
+                    self.send_json(app.update_category(payload.get("category") or payload.get("id") or payload.get("slug") or payload.get("name"), payload))
+                    return
+                if parsed.path == "/api/category/delete":
+                    self.send_json(app.delete_category(payload.get("category") or payload.get("id") or payload.get("slug") or payload.get("name"), force=bool(payload.get("force", True))))
+                    return
+                if parsed.path == "/api/posts":
+                    self.send_json(
+                        app.create_post_project(
+                            session_id=payload.get("session_id") or None,
+                            title=str(payload.get("title", "")),
+                            instruction=str(payload.get("instruction", "")),
+                            categories=list_from_value(payload.get("categories")),
+                            source_language=str(payload.get("source_language", "en")),
+                        )
+                    )
+                    return
+                if parsed.path == "/api/post/select":
+                    self.send_json(app.set_active_post_project(str(payload.get("session_id", "")), str(payload.get("post_project_id", ""))))
+                    return
+                if parsed.path == "/api/post/draft":
+                    self.send_json(
+                        app.draft_post_project(
+                            str(payload.get("post_project_id") or "") or None,
+                            str(payload.get("session_id", "")),
+                            instruction=str(payload.get("instruction", "")),
+                            status=str(payload.get("status", "draft")),
+                        )
+                    )
+                    return
+                if parsed.path == "/api/post/publish":
+                    self.send_json(
+                        app.publish_post_project(
+                            str(payload.get("post_project_id") or "") or None,
+                            str(payload.get("session_id", "")),
+                            status=str(payload.get("status", "draft")),
+                            force_redraft=bool(payload.get("force_redraft", False)),
+                            instruction=str(payload.get("instruction", "")),
+                            update_existing=bool(payload.get("update_existing", True)),
+                        )
+                    )
+                    return
+                if parsed.path == "/api/post/link":
+                    self.send_json(
+                        app.link_post_project(
+                            str(payload.get("post_project_id", "")),
+                            payload.get("post_id"),
+                            status=str(payload.get("status", "")),
+                            link=str(payload.get("link", "")),
+                        )
+                    )
                     return
                 if parsed.path == "/api/draft":
                     self.send_json(
