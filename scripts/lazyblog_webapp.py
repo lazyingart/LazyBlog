@@ -24,7 +24,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from lazyblog_sync import LazyBlogError, WPClient, make_client, markdown_to_html, require_auth
+from lazyblog_sync import LazyBlogError, WPClient, html_to_markdown, make_client, markdown_to_html, require_auth
 from lazyblog_translate import first_heading, load_env_file, split_front_matter
 
 
@@ -38,13 +38,18 @@ CATEGORY_SNAPSHOT_PATH = TAXONOMY_ROOT / "categories.json"
 POST_PROJECT_ROOT = ROOT_DIR / "content" / "studio-posts"
 CHAT_REPLY_PROMPT = ROOT_DIR / "prompts" / "web-chat-reply.txt"
 CHAT_TASK_PROMPT = ROOT_DIR / "prompts" / "web-draft-task.txt"
+CHAT_ACTION_PROMPT = ROOT_DIR / "prompts" / "web-action-router.txt"
+GIT_COMMIT_PROMPT = ROOT_DIR / "prompts" / "web-git-commit-push.txt"
 CODEX_RESPONSE_PROMPT = ROOT_DIR / "prompts" / "web-codex-response.txt"
 CHAT_REPLY_SCHEMA = ROOT_DIR / "schemas" / "lazyblog_chat_reply.schema.json"
 CHAT_TASK_SCHEMA = ROOT_DIR / "schemas" / "lazyblog_chat_task.schema.json"
+CHAT_ACTION_SCHEMA = ROOT_DIR / "schemas" / "lazyblog_action.schema.json"
 CODEX_RESPONSE_SCHEMA = ROOT_DIR / "schemas" / "lazyblog_codex_response.schema.json"
 CODEX_TRANSLATION_SCHEMA = ROOT_DIR / "schemas" / "lazyblog_web_translation.schema.json"
 DEFAULT_MODEL = "gpt-5.4"
 DEFAULT_REASONING = "low"
+DEFAULT_ACTION_MODEL = "gpt-5.3-codex-spark"
+DEFAULT_ACTION_REASONING = "medium"
 DEFAULT_MESSAGE_BATCH_SIZE = 10
 STUDIO_AUTH_COOKIE = "lazyblog_studio_auth"
 STUDIO_AUTH_TTL_SECONDS = 60 * 60 * 24 * 30
@@ -120,6 +125,12 @@ def slugify(value: str, fallback: str = "post") -> str:
     lowered = re.sub(r"[^\w\s-]", "", lowered, flags=re.UNICODE)
     lowered = re.sub(r"[\s_-]+", "-", lowered, flags=re.UNICODE).strip("-")
     return lowered or fallback
+
+
+def safe_slug_token(value: str, fallback: str = "post") -> str:
+    token = slugify(value, fallback=fallback)
+    token = re.sub(r"[^A-Za-z0-9_.-]+", "-", token).strip("-")
+    return token or fallback
 
 
 def safe_session_id(value: str) -> str:
@@ -299,6 +310,161 @@ exit 1
     subprocess.run(["flock", str(lock_path), "bash", "-lc", script], cwd=ROOT_DIR, check=True)
 
 
+def git_commit_push_mixed(
+    *,
+    force_paths: list[Path] | None = None,
+    tracked_paths: list[Path] | None = None,
+    message: str,
+    branch: str,
+    enabled: bool,
+) -> None:
+    if not enabled:
+        return
+    force_relative = [str(path.relative_to(ROOT_DIR)) for path in (force_paths or []) if path.exists()]
+    tracked_relative = [str(path.relative_to(ROOT_DIR)) for path in (tracked_paths or []) if path.exists()]
+    all_relative = [*force_relative, *tracked_relative]
+    if not all_relative:
+        return
+    lock_path = ROOT_DIR / ".git" / "lazyblog-webapp.lock"
+    lock_path.parent.mkdir(exist_ok=True)
+    force_add = f"git add -f -- {' '.join(json.dumps(path) for path in force_relative)}" if force_relative else ":"
+    tracked_add = f"git add -u -- {' '.join(json.dumps(path) for path in tracked_relative)}" if tracked_relative else ":"
+    path_args = " ".join(json.dumps(path) for path in all_relative)
+    script = f"""
+set -euo pipefail
+cd {json.dumps(str(ROOT_DIR))}
+{force_add}
+{tracked_add}
+if git diff --cached --quiet -- {path_args}; then
+  echo "No changes to commit for: {message}"
+  exit 0
+fi
+git commit -m {json.dumps(message)}
+for attempt in 1 2 3 4 5; do
+  if git push origin HEAD:{json.dumps(branch)}; then
+    exit 0
+  fi
+  git fetch origin {json.dumps(branch)} || true
+  git rebase origin/{branch} || git rebase --abort || true
+  sleep $((attempt * 2))
+done
+echo "Failed to push after retries: {message}" >&2
+exit 1
+"""
+    subprocess.run(["flock", str(lock_path), "bash", "-lc", script], cwd=ROOT_DIR, check=True)
+
+
+def codex_git_commit_push_mixed(
+    *,
+    force_paths: list[Path] | None = None,
+    tracked_paths: list[Path] | None = None,
+    message: str,
+    branch: str,
+    enabled: bool,
+    model: str = DEFAULT_ACTION_MODEL,
+    reasoning: str = DEFAULT_ACTION_REASONING,
+    timeout: int = 600,
+) -> None:
+    if not enabled:
+        return
+    force_relative = [str(path.relative_to(ROOT_DIR)) for path in (force_paths or []) if path.exists()]
+    tracked_relative = [str(path.relative_to(ROOT_DIR)) for path in (tracked_paths or []) if path.exists()]
+    all_relative = [*force_relative, *tracked_relative]
+    if not all_relative:
+        return
+
+    run_dir = JOB_ROOT / "git-commit-push" / f"{stamp()}-{uuid.uuid4().hex[:8]}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = ROOT_DIR / ".git" / "lazyblog-webapp.lock"
+    lock_path.parent.mkdir(exist_ok=True)
+    force_add = f"git add -f -- {' '.join(json.dumps(path) for path in force_relative)}" if force_relative else ":"
+    tracked_add = f"git add -u -- {' '.join(json.dumps(path) for path in tracked_relative)}" if tracked_relative else ":"
+    path_args = " ".join(json.dumps(path) for path in all_relative)
+    script_path = run_dir / "commit-push.sh"
+    script = f"""#!/usr/bin/env bash
+set -euo pipefail
+cd {json.dumps(str(ROOT_DIR))}
+{force_add}
+{tracked_add}
+if git diff --cached --quiet -- {path_args}; then
+  echo "No changes to commit for: {message}"
+  exit 0
+fi
+git commit -m {json.dumps(message)}
+for attempt in 1 2 3 4 5; do
+  if git push origin HEAD:{json.dumps(branch)}; then
+    exit 0
+  fi
+  git fetch origin {json.dumps(branch)} || true
+  git rebase origin/{branch} || git rebase --abort || true
+  sleep $((attempt * 2))
+done
+echo "Failed to push after retries: {message}" >&2
+exit 1
+"""
+    script_path.write_text(script, encoding="utf-8")
+    script_path.chmod(0o700)
+    payload = {
+        "script_path": str(script_path),
+        "root_dir": str(ROOT_DIR),
+        "force_paths": force_relative,
+        "tracked_paths": tracked_relative,
+        "message": message,
+        "branch": branch,
+        "model": model,
+        "reasoning": reasoning,
+        "contract": "Run only bash script_path. The script contains the exact allowlisted git operation.",
+    }
+    write_json(run_dir / "input.json", payload)
+    prompt = (
+        load_prompt(GIT_COMMIT_PROMPT)
+        + "\n\nInput JSON follows.\n\n"
+        + json.dumps(payload, ensure_ascii=False, indent=2)
+        + "\n"
+    )
+    (run_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
+    cmd = [
+        "codex",
+        "exec",
+        "--ephemeral",
+        "--model",
+        model,
+        "-c",
+        f'model_reasoning_effort="{reasoning}"',
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--cd",
+        str(ROOT_DIR),
+        "--output-last-message",
+        str(run_dir / "output.txt"),
+        "-",
+    ]
+    proc = subprocess.run(
+        ["flock", str(lock_path), *cmd],
+        input=prompt,
+        text=True,
+        cwd=ROOT_DIR,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+    (run_dir / "stdout.log").write_text(proc.stdout or "", encoding="utf-8")
+    (run_dir / "stderr.log").write_text(proc.stderr or "", encoding="utf-8")
+    write_json(
+        run_dir / "run.json",
+        {
+            "model": model,
+            "reasoning": reasoning,
+            "returncode": proc.returncode,
+            "paths": all_relative,
+            "message": message,
+            "branch": branch,
+            "finished_at": now_iso(),
+        },
+    )
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd, output=proc.stdout, stderr=proc.stderr)
+
+
 class LazyBlogStudio:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -328,6 +494,26 @@ class LazyBlogStudio:
     def save_session(self, session_id: str, meta: dict[str, Any]) -> None:
         meta["updated_at"] = now_iso()
         write_json(self.session_meta_path(session_id), meta)
+
+    def commit_session_state(self, session_id: str, message: str) -> None:
+        try:
+            codex_git_commit_push_mixed(
+                tracked_paths=[self.session_meta_path(session_id)],
+                message=message,
+                branch=self.args.branch,
+                enabled=self.args.commit_push,
+                timeout=self.args.git_codex_timeout,
+            )
+        except subprocess.CalledProcessError:
+            try:
+                git_commit_push_mixed(
+                    tracked_paths=[self.session_meta_path(session_id)],
+                    message=message,
+                    branch=self.args.branch,
+                    enabled=self.args.commit_push,
+                )
+            except subprocess.CalledProcessError:
+                pass
 
     def create_session(self, first_message: str = "") -> dict[str, Any]:
         session_id = self.new_session_id()
@@ -725,7 +911,7 @@ Rules:
         return guessed
 
     def new_post_project_id(self, title: str) -> str:
-        base = slugify(title, "post")[:48].strip("-") or "post"
+        base = safe_slug_token(title, "post")[:48].strip("-") or "post"
         return f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{base}-{uuid.uuid4().hex[:6]}"
 
     def post_project_dir(self, post_project_id: str) -> Path:
@@ -829,6 +1015,7 @@ Rules:
             session = self.load_session(safe_session)
             session["active_post_project_id"] = ""
             self.save_session(safe_session, session)
+            self.commit_session_state(safe_session, f"Clear LazyBlog Studio selected post for {safe_session}")
             return self.session_payload(safe_session)
         project = self.load_post_project(post_project_id)
         sessions = list_from_value(project.get("source_sessions"))
@@ -842,6 +1029,11 @@ Rules:
         if draft_path:
             session["latest_draft"] = str(draft_path.relative_to(ROOT_DIR))
         self.save_session(safe_session, session)
+        self.commit_post_state(
+            post_project_id=str(project["id"]),
+            session_id=safe_session,
+            message=f"Select LazyBlog Studio post {project['id']}",
+        )
         return self.session_payload(safe_session)
 
     def create_post_project(
@@ -885,15 +1077,11 @@ Rules:
             session = self.load_session(safe_session)
             session["active_post_project_id"] = post_project_id
             self.save_session(safe_session, session)
-        try:
-            git_commit_push(
-                [self.post_project_dir(post_project_id)],
-                f"Create LazyBlog Studio post {post_project_id}",
-                self.args.branch,
-                self.args.commit_push,
-            )
-        except subprocess.CalledProcessError:
-            pass
+        self.commit_post_state(
+            post_project_id=post_project_id,
+            session_id=safe_session,
+            message=f"Create LazyBlog Studio post {post_project_id}",
+        )
         return self.post_project_payload(post_project_id)
 
     def active_post_project_id(self, session_id: str) -> str:
@@ -907,6 +1095,324 @@ Rules:
                 session["active_post_project_id"] = ""
                 self.save_session(session_id, session)
         return ""
+
+    def commit_post_state(
+        self,
+        *,
+        post_project_id: str | None = None,
+        session_id: str | None = None,
+        local_post_dir: Path | None = None,
+        extra_force_paths: list[Path] | None = None,
+        message: str,
+    ) -> None:
+        force_paths: list[Path] = []
+        if post_project_id:
+            force_paths.append(self.post_project_dir(post_project_id))
+        if local_post_dir:
+            force_paths.append(local_post_dir)
+        force_paths.extend(extra_force_paths or [])
+        tracked_paths = [self.session_meta_path(session_id)] if session_id else []
+        try:
+            codex_git_commit_push_mixed(
+                force_paths=force_paths,
+                tracked_paths=tracked_paths,
+                message=message,
+                branch=self.args.branch,
+                enabled=self.args.commit_push,
+                timeout=self.args.git_codex_timeout,
+            )
+        except subprocess.CalledProcessError:
+            try:
+                git_commit_push_mixed(
+                    force_paths=force_paths,
+                    tracked_paths=tracked_paths,
+                    message=message,
+                    branch=self.args.branch,
+                    enabled=self.args.commit_push,
+                )
+            except subprocess.CalledProcessError:
+                pass
+
+    def post_project_for_wp_post_id(self, post_id: int) -> dict[str, Any] | None:
+        for path in POST_PROJECT_ROOT.glob("*/post.json"):
+            try:
+                project = self.normalize_post_project(read_json(path))
+            except (json.JSONDecodeError, OSError):
+                continue
+            wordpress = project.get("wordpress") if isinstance(project.get("wordpress"), dict) else {}
+            if int(wordpress.get("post_id") or 0) == int(post_id):
+                project["id"] = path.parent.name
+                return project
+        return None
+
+    def local_post_dir(self, post_id: int) -> Path:
+        return ROOT_DIR / "content" / "posts" / str(int(post_id))
+
+    def local_post_manifest(self, post_id: int) -> dict[str, Any] | None:
+        path = self.local_post_dir(post_id) / "lazyblog.json"
+        if not path.exists():
+            return None
+        try:
+            return read_json(path)
+        except json.JSONDecodeError:
+            return None
+
+    def category_names_for_ids(self, category_ids: list[int]) -> tuple[list[str], list[str]]:
+        categories = {int(row.get("term_id") or 0): row for row in self.category_records(sync_if_missing=True)}
+        names: list[str] = []
+        slugs: list[str] = []
+        for category_id in category_ids:
+            row = categories.get(int(category_id))
+            if not row:
+                continue
+            names.append(str(row.get("name") or ""))
+            slugs.append(str(row.get("slug") or ""))
+        return [name for name in names if name], [slug for slug in slugs if slug]
+
+    def pull_wordpress_post_to_local(self, post: dict[str, Any], source_language: str = "en") -> tuple[Path, Path, dict[str, Any]]:
+        post_id = int(post.get("id") or 0)
+        if post_id <= 0:
+            raise WebAppError("WordPress post response did not include a valid id")
+        post_dir = self.local_post_dir(post_id)
+        post_dir.mkdir(parents=True, exist_ok=True)
+        for dirname in ["translations", "prompts", "logs"]:
+            (post_dir / dirname).mkdir(parents=True, exist_ok=True)
+
+        category_ids = [int(value) for value in post.get("categories", []) if str(value).isdigit()]
+        category_names, category_slugs = self.category_names_for_ids(category_ids)
+        front_matter = {
+            "id": post_id,
+            "source_language": source_language,
+            "title": html.unescape(re.sub(r"<[^>]+>", "", str(post.get("title", {}).get("rendered", "")))).strip(),
+            "slug": post.get("slug", ""),
+            "date": post.get("date", ""),
+            "modified": post.get("modified", ""),
+            "status": post.get("status", ""),
+            "link": post.get("link", ""),
+            "categories": category_names,
+        }
+        raw_html = post.get("content", {}).get("raw") or post.get("content", {}).get("rendered", "")
+        markdown_body = html_to_markdown(raw_html, self.wp_client().site_url)
+        post_path = post_dir / "post.md"
+        write_markdown(post_path, front_matter, markdown_body)
+
+        existing_manifest = self.local_post_manifest(post_id) or {}
+        manifest = {
+            "version": 1,
+            "post_id": post_id,
+            "source_language": source_language,
+            "source_file": "post.md",
+            "translations_dir": "translations",
+            "media": existing_manifest.get("media", {}),
+            "categories": category_names,
+            "category_slugs": category_slugs,
+            "category_ids": category_ids,
+            "last_pull": {
+                "at": int(time.time()),
+                "modified": post.get("modified"),
+                "link": post.get("link"),
+                "status": post.get("status"),
+            },
+            "last_push": existing_manifest.get("last_push"),
+        }
+        write_json(post_dir / "lazyblog.json", manifest)
+        return post_dir, post_path, manifest
+
+    def url_post_candidates(self, raw_url: str) -> tuple[list[int], str]:
+        parsed = urllib.parse.urlparse(raw_url)
+        numbers = [int(match) for match in re.findall(r"/(\d+)(?=/|$)", parsed.path)]
+        preferred = [value for value in numbers if value >= 1000 and not 1900 <= value <= 2100]
+        ordered = [*preferred, *[value for value in numbers if value not in preferred]]
+        seen: set[int] = set()
+        post_ids = []
+        for value in ordered:
+            if value not in seen:
+                seen.add(value)
+                post_ids.append(value)
+        slug = Path(urllib.parse.unquote(parsed.path)).name
+        if slug.endswith(".html"):
+            slug = slug[:-5]
+        return post_ids, slug
+
+    def local_post_candidates(self, query: str, limit: int = 10) -> list[int]:
+        terms = extract_terms(query, limit=8)
+        if not terms:
+            return []
+        matches: list[tuple[int, int]] = []
+        for manifest_path in sorted((ROOT_DIR / "content" / "posts").glob("*/lazyblog.json")):
+            try:
+                manifest = read_json(manifest_path)
+            except json.JSONDecodeError:
+                continue
+            post_id = int(manifest.get("post_id") or manifest_path.parent.name)
+            post_text = ""
+            post_path = manifest_path.parent / "post.md"
+            if post_path.exists():
+                post_text = post_path.read_text(encoding="utf-8", errors="replace")
+            haystack = json.dumps(manifest, ensure_ascii=False) + "\n" + post_text
+            score = sum(haystack.casefold().count(term.casefold()) for term in terms)
+            if score > 0:
+                matches.append((post_id, score))
+        return [post_id for post_id, _ in sorted(matches, key=lambda item: item[1], reverse=True)[:limit]]
+
+    def resolve_wordpress_post(self, query: str) -> dict[str, Any]:
+        clean = query.strip()
+        if not clean:
+            raise WebAppError("post query cannot be empty")
+        client = self.wp_client()
+        parsed = urllib.parse.urlparse(clean)
+        post_ids: list[int] = []
+        slug = ""
+        if parsed.scheme in {"http", "https"}:
+            post_ids, slug = self.url_post_candidates(clean)
+        elif clean.isdigit():
+            post_ids = [int(clean)]
+
+        for post_id in post_ids:
+            try:
+                return client.get_post(post_id)
+            except Exception:
+                continue
+
+        if slug:
+            path = "/wp-json/wp/v2/posts?" + urllib.parse.urlencode({"slug": slug, "status": "any", "context": "edit", "per_page": 5})
+            rows = client.request("GET", path)
+            if isinstance(rows, list) and rows:
+                return rows[0]
+
+        for post_id in self.local_post_candidates(clean, limit=5):
+            try:
+                return client.get_post(post_id)
+            except Exception:
+                continue
+
+        search_path = "/wp-json/wp/v2/posts?" + urllib.parse.urlencode({"search": clean, "status": "any", "context": "edit", "per_page": 10})
+        rows = client.request("GET", search_path)
+        if isinstance(rows, list) and rows:
+            return rows[0]
+        raise WebAppError(f"could not resolve WordPress post from: {clean}")
+
+    def select_or_import_wordpress_post(self, session_id: str, query: str, sync_mode: str = "pull") -> dict[str, Any]:
+        session_id = safe_session_id(session_id)
+        post = self.resolve_wordpress_post(query)
+        post_id = int(post.get("id") or 0)
+        source_language = "en"
+        try:
+            translation_meta = self.wp_client().get_translations(post_id)
+            source_language = str(translation_meta.get("source_language") or source_language)
+        except Exception:
+            pass
+
+        local_post_dir = self.local_post_dir(post_id)
+        local_post_path = local_post_dir / "post.md"
+        manifest = self.local_post_manifest(post_id) or {}
+        if sync_mode in {"pull", "auto"} or not local_post_path.exists():
+            local_post_dir, local_post_path, manifest = self.pull_wordpress_post_to_local(post, source_language=source_language)
+
+        markdown = local_post_path.read_text(encoding="utf-8") if local_post_path.exists() else ""
+        metadata = self.markdown_post_metadata(markdown, fallback_title=f"WordPress post {post_id}")
+        project = self.post_project_for_wp_post_id(post_id)
+        if project is None:
+            title = metadata["title"] or f"WordPress post {post_id}"
+            project_id = f"wp-{post_id}-{safe_slug_token(title, 'post')[:48].strip('-') or 'post'}"
+            counter = 2
+            base_project_id = project_id
+            while self.post_project_meta_path(project_id).exists():
+                project_id = f"{base_project_id}-{counter}"
+                counter += 1
+            project = {
+                "version": 1,
+                "id": project_id,
+                "created_at": now_iso(),
+                "updated_at": now_iso(),
+                "source_sessions": [],
+                "current_draft": "",
+                "wordpress": {},
+            }
+        project = self.normalize_post_project(project)
+        sessions = list_from_value(project.get("source_sessions"))
+        if session_id not in sessions:
+            sessions.append(session_id)
+
+        draft_path = self.post_project_dir(str(project["id"])) / "drafts" / f"{stamp()}-pulled-{safe_slug_token(metadata['title'], 'post')}.md"
+        if sync_mode in {"pull", "auto"} or not self.current_draft_path_for_project(project):
+            draft_path.parent.mkdir(parents=True, exist_ok=True)
+            draft_path.write_text(markdown, encoding="utf-8")
+            project["current_draft"] = str(draft_path.relative_to(self.post_project_dir(str(project["id"]))))
+
+        project.update(
+            {
+                "title": metadata["title"],
+                "slug": metadata["slug"],
+                "source_language": source_language if source_language in {"en", "ja", "zh"} else metadata["source_language"],
+                "categories": list_from_value(metadata.get("categories")) or list_from_value(manifest.get("categories")),
+                "tags": list_from_value(metadata.get("tags")),
+                "source_sessions": sessions,
+                "wordpress": {
+                    "post_id": post_id,
+                    "status": post.get("status") or manifest.get("last_pull", {}).get("status") or "draft",
+                    "link": post.get("link") or manifest.get("last_pull", {}).get("link") or "",
+                },
+                "local_mirror": {
+                    "post_dir": str(local_post_dir.relative_to(ROOT_DIR)),
+                    "post_path": str(local_post_path.relative_to(ROOT_DIR)),
+                    "last_sync_mode": sync_mode,
+                    "last_selected_at": now_iso(),
+                },
+            }
+        )
+        self.save_post_project(project)
+        session = self.load_session(session_id)
+        session["active_post_project_id"] = str(project["id"])
+        if project.get("current_draft"):
+            current = self.current_draft_path_for_project(project)
+            if current:
+                session["latest_draft"] = str(current.relative_to(ROOT_DIR))
+        self.save_session(session_id, session)
+        self.commit_post_state(
+            post_project_id=str(project["id"]),
+            session_id=session_id,
+            local_post_dir=local_post_dir,
+            message=f"Select LazyBlog post {post_id}",
+        )
+        return {
+            **self.session_payload(session_id),
+            **self.post_project_payload(str(project["id"])),
+            "resolved_post": {
+                "post_id": post_id,
+                "title": metadata["title"],
+                "status": post.get("status"),
+                "link": post.get("link"),
+                "local_post_dir": str(local_post_dir.relative_to(ROOT_DIR)),
+                "sync_mode": sync_mode,
+            },
+        }
+
+    def extract_post_reference_from_message(self, message: str) -> str:
+        urls = re.findall(r"https?://[^\s<>)\"']+", message)
+        if urls:
+            return urls[0].rstrip(".,;!?")
+        lowered = message.casefold()
+        if any(word in lowered for word in ["select post", "edit post", "update post", "pull post", "sync post"]):
+            match = re.search(r"\bpost\s+#?(\d{2,})\b", message, flags=re.IGNORECASE)
+            if match:
+                return match.group(1)
+        return ""
+
+    def maybe_select_post_from_chat(self, session_id: str, message: str) -> dict[str, Any] | None:
+        reference = self.extract_post_reference_from_message(message)
+        if not reference:
+            return None
+        try:
+            result = self.select_or_import_wordpress_post(session_id, reference, sync_mode="pull")
+            return {
+                "action": "select_post",
+                "reference": reference,
+                "resolved_post": result.get("resolved_post", {}),
+                "post_project": result.get("post_project", {}),
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {"action": "select_post", "reference": reference, "error": str(exc)}
 
     def new_job_id(self, tool_name: str) -> str:
         return f"{stamp()}-{uuid.uuid4().hex[:8]}-{slugify(tool_name, 'codex')}"
@@ -940,10 +1446,11 @@ Rules:
             "response": CODEX_RESPONSE_SCHEMA,
             "reply": CHAT_REPLY_SCHEMA,
             "task": CHAT_TASK_SCHEMA,
+            "action": CHAT_ACTION_SCHEMA,
             "translation": CODEX_TRANSLATION_SCHEMA,
         }
         if schema_name not in schemas:
-            raise WebAppError("schema must be one of: response, reply, task, translation")
+            raise WebAppError("schema must be one of: response, reply, task, action, translation")
         return schemas[schema_name]
 
     def prompt_path_for_tool(self, tool_name: str) -> Path:
@@ -952,9 +1459,10 @@ Rules:
             "assistant": CODEX_RESPONSE_PROMPT,
             "reply": CHAT_REPLY_PROMPT,
             "task": CHAT_TASK_PROMPT,
+            "action": CHAT_ACTION_PROMPT,
         }
         if tool_name not in prompts:
-            raise WebAppError("tool must be one of: response, assistant, reply, task")
+            raise WebAppError("tool must be one of: response, assistant, reply, task, action")
         return prompts[tool_name]
 
     def default_schema_for_tool(self, tool_name: str) -> str:
@@ -962,6 +1470,8 @@ Rules:
             return "reply"
         if tool_name == "task":
             return "task"
+        if tool_name == "action":
+            return "action"
         return "response"
 
     def session_context(self, session_id: str | None, prompt: str) -> dict[str, Any]:
@@ -1016,6 +1526,21 @@ Rules:
                     "schema": job["schema"],
                 },
             }
+        elif tool_name == "action":
+            message = prompt or str(input_payload.get("message") or "")
+            if not message.strip():
+                raise WebAppError("action tool requires prompt or input.message")
+            tool_input = {
+                **session_context,
+                "message": message,
+                "input": input_payload,
+                "api_contract": {
+                    "job_id": job["id"],
+                    "tool": tool_name,
+                    "schema": job["schema"],
+                    "output_path": job["paths"]["output"],
+                },
+            }
         else:
             if not prompt:
                 raise WebAppError("response/assistant tool requires prompt")
@@ -1056,6 +1581,8 @@ Rules:
             return self.mock_tool("reply", {"message": request_payload.get("prompt") or request_payload.get("input", {}).get("message", "")})
         if tool_name == "task":
             return self.mock_tool("task", {"transcript": request_payload.get("prompt", "")})
+        if tool_name == "action":
+            return self.mock_tool("action", {"message": request_payload.get("prompt") or request_payload.get("input", {}).get("message", "")})
         return {
             "status": "completed",
             "answer": f"Mock Codex API response for: {str(request_payload.get('prompt') or '')[:240]}",
@@ -1320,6 +1847,8 @@ Rules:
         prompt_template_path: Path,
         schema_path: Path,
         payload: dict[str, Any],
+        model: str | None = None,
+        reasoning: str | None = None,
     ) -> dict[str, Any]:
         run_dir = self.session_dir(session_id) / "tool-runs" / f"{stamp()}-{uuid.uuid4().hex[:6]}-{tool_name}"
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -1339,14 +1868,16 @@ Rules:
             write_json(output_path, result)
             return result
 
+        resolved_model = model or self.args.model
+        resolved_reasoning = reasoning or self.args.reasoning
         cmd = [
             "codex",
             "exec",
             "--ephemeral",
             "--model",
-            self.args.model,
+            resolved_model,
             "-c",
-            f'model_reasoning_effort="{self.args.reasoning}"',
+            f'model_reasoning_effort="{resolved_reasoning}"',
             "--dangerously-bypass-approvals-and-sandbox",
             "--cd",
             str(ROOT_DIR),
@@ -1372,8 +1903,8 @@ Rules:
             run_dir / "run.json",
             {
                 "tool": tool_name,
-                "model": self.args.model,
-                "reasoning": self.args.reasoning,
+                "model": resolved_model,
+                "reasoning": resolved_reasoning,
                 "returncode": proc.returncode,
                 "elapsed_seconds": round(time.time() - started, 2),
                 "output": str(output_path.relative_to(ROOT_DIR)) if output_path.exists() else "",
@@ -1386,6 +1917,18 @@ Rules:
         return json.loads(output_path.read_text(encoding="utf-8"))
 
     def mock_tool(self, tool_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if tool_name == "action":
+            message = str(payload.get("message") or "")
+            reference = self.extract_post_reference_from_message(message)
+            return {
+                "action": "select_post" if reference else "no_op",
+                "post_reference": reference,
+                "category": "",
+                "parent_category": "",
+                "sync_mode": "pull" if reference else "",
+                "reason": "Mock action router used deterministic link/id extraction.",
+                "confidence": 0.9 if reference else 0.4,
+            }
         if tool_name == "reply":
             message = payload.get("message", "")
             return {
@@ -1424,12 +1967,86 @@ Rules:
             "notes": ["Mock mode was enabled; no Codex model was called."],
         }
 
+    def route_chat_action(self, session_id: str, message: str) -> dict[str, Any]:
+        payload = {
+            "session": self.load_session(session_id),
+            "message": message,
+            "transcript": self.transcript(session_id, limit=12),
+            "active_post_project_id": self.active_post_project_id(session_id),
+            "post_projects": self.list_post_projects(session_id=session_id, limit=20),
+            "category_mirror": self.search_categories(limit=120).get("categories", []),
+            "detected_post_reference": self.extract_post_reference_from_message(message),
+            "control_surface": {
+                "allowed_actions": ["select_post", "create_category", "sync_categories", "no_op"],
+                "execution_rule": "Return one action. Backend executes the corresponding controlled API.",
+            },
+        }
+        try:
+            routed = self.run_codex_tool(
+                session_id=session_id,
+                tool_name="action",
+                prompt_template_path=CHAT_ACTION_PROMPT,
+                schema_path=CHAT_ACTION_SCHEMA,
+                payload=payload,
+                model=DEFAULT_ACTION_MODEL,
+                reasoning=DEFAULT_ACTION_REASONING,
+            )
+        except Exception as exc:  # noqa: BLE001
+            reference = self.extract_post_reference_from_message(message)
+            routed = {
+                "action": "select_post" if reference else "no_op",
+                "post_reference": reference,
+                "category": "",
+                "parent_category": "",
+                "sync_mode": "pull" if reference else "",
+                "reason": f"action router failed, used deterministic fallback: {exc}",
+                "confidence": 0.85 if reference else 0.0,
+            }
+        reference = self.extract_post_reference_from_message(message)
+        if reference and routed.get("action") == "no_op":
+            routed.update({"action": "select_post", "post_reference": reference, "sync_mode": "pull", "confidence": 0.9})
+        if reference and routed.get("action") == "select_post" and not str(routed.get("post_reference") or "").strip():
+            routed["post_reference"] = reference
+        return routed
+
+    def execute_chat_action(self, session_id: str, routed: dict[str, Any]) -> dict[str, Any]:
+        action = str(routed.get("action") or "no_op")
+        confidence = float(routed.get("confidence") or 0)
+        if action == "select_post" and confidence >= 0.55:
+            reference = str(routed.get("post_reference") or "").strip()
+            if not reference:
+                return {"action": action, "status": "skipped", "reason": "missing post reference", "routed": routed}
+            sync_mode = str(routed.get("sync_mode") or "pull")
+            if sync_mode not in {"pull", "push", "auto"}:
+                sync_mode = "pull"
+            result = self.select_or_import_wordpress_post(session_id, reference, sync_mode=sync_mode)
+            return {
+                "action": action,
+                "status": "executed",
+                "routed": routed,
+                "resolved_post": result.get("resolved_post", {}),
+                "post_project": result.get("post_project", {}),
+            }
+        if action == "create_category" and confidence >= 0.7:
+            category = str(routed.get("category") or "").strip()
+            if not category:
+                return {"action": action, "status": "skipped", "reason": "missing category", "routed": routed}
+            result = self.create_category(category, parent=str(routed.get("parent_category") or ""))
+            self.commit_post_state(extra_force_paths=[CATEGORY_SNAPSHOT_PATH], message=f"Sync LazyBlog category {category}")
+            return {"action": action, "status": "executed", "routed": routed, "category": result.get("category")}
+        if action == "sync_categories" and confidence >= 0.55:
+            mirror = self.sync_category_mirror()
+            self.commit_post_state(extra_force_paths=[CATEGORY_SNAPSHOT_PATH], message="Sync LazyBlog category mirror")
+            return {"action": action, "status": "executed", "routed": routed, "category_count": len(mirror.get("categories", []))}
+        return {"action": action, "status": "no_op", "routed": routed}
+
     def reply(self, message: str, session_id: str | None = None) -> dict[str, Any]:
         if not message.strip():
             raise WebAppError("message is empty")
         session = self.create_session(message) if not session_id else self.load_session(safe_session_id(session_id))
         session_id = session["id"]
         user_path = self.append_message(session_id, "user", message)
+        action_result = self.execute_chat_action(session_id, self.route_chat_action(session_id, message))
         local_matches = self.search_local_content(message)
         payload = {
             "session": self.load_session(session_id),
@@ -1437,6 +2054,7 @@ Rules:
             "transcript": self.transcript(session_id),
             "local_matches": local_matches,
             "category_snapshot": self.category_snapshot(),
+            "controlled_action_result": action_result,
             "control_surface": {
                 "chat_rule": "Send & Store only records chat memory and replies. It must not claim a WordPress/category action has been completed.",
                 "managed_objects": ["ChatSession", "PostProject", "WordPressPost", "CategoryMirror"],
@@ -1475,6 +2093,7 @@ Rules:
         return {
             **self.session_payload(session_id),
             "reply": result,
+            "action_result": action_result,
             "assistant_path": str(assistant_path.relative_to(ROOT_DIR)),
         }
 
@@ -1692,15 +2311,11 @@ Rules:
         session["latest_draft"] = str(draft_path.relative_to(ROOT_DIR))
         self.save_session(session_id, session)
         warnings: list[str] = []
-        try:
-            git_commit_push(
-                [self.post_project_dir(resolved_post_project_id), self.session_dir(session_id)],
-                f"Draft LazyBlog Studio post {resolved_post_project_id}",
-                self.args.branch,
-                self.args.commit_push,
-            )
-        except subprocess.CalledProcessError as exc:
-            warnings.append(f"git commit/push failed: {exc}")
+        self.commit_post_state(
+            post_project_id=resolved_post_project_id,
+            session_id=session_id,
+            message=f"Draft LazyBlog Studio post {resolved_post_project_id}",
+        )
         payload = {
             **self.session_payload(session_id),
             **self.post_project_payload(resolved_post_project_id),
@@ -1793,16 +2408,11 @@ Rules:
         session = self.load_session(session_id)
         session.setdefault("published", []).append(published)
         self.save_session(session_id, session)
-        try:
-            git_commit_push(
-                [self.session_dir(session_id), self.draft_folder(session_id)],
-                f"Publish LazyBlog Studio draft {post.get('id')}",
-                self.args.branch,
-                self.args.commit_push,
-            )
-        except subprocess.CalledProcessError as exc:
-            published.setdefault("warnings", []).append(f"git commit/push failed: {exc}")
-            write_json(publish_path, published)
+        self.commit_post_state(
+            session_id=session_id,
+            extra_force_paths=[self.draft_folder(session_id)],
+            message=f"Publish LazyBlog Studio draft {post.get('id')}",
+        )
         return {
             **self.session_payload(session_id),
             "draft": {
@@ -1909,16 +2519,12 @@ Rules:
         session["active_post_project_id"] = resolved_post_project_id
         session.setdefault("published", []).append(published)
         self.save_session(session_id, session)
-        try:
-            git_commit_push(
-                [self.post_project_dir(resolved_post_project_id), self.session_dir(session_id), CATEGORY_SNAPSHOT_PATH],
-                f"Publish LazyBlog Studio post {post.get('id')}",
-                self.args.branch,
-                self.args.commit_push,
-            )
-        except subprocess.CalledProcessError as exc:
-            published.setdefault("warnings", []).append(f"git commit/push failed: {exc}")
-            write_json(event_path, published)
+        self.commit_post_state(
+            post_project_id=resolved_post_project_id,
+            session_id=session_id,
+            extra_force_paths=[CATEGORY_SNAPSHOT_PATH],
+            message=f"Publish LazyBlog Studio post {post.get('id')}",
+        )
         return {
             **self.session_payload(session_id),
             **self.post_project_payload(resolved_post_project_id),
@@ -1946,6 +2552,10 @@ Rules:
             "link": resolved_link,
         }
         self.save_post_project(project)
+        self.commit_post_state(
+            post_project_id=str(project["id"]),
+            message=f"Link LazyBlog Studio post {project['id']} to WordPress {resolved_post_id}",
+        )
         return self.post_project_payload(str(project["id"]))
 
     def session_payload(self, session_id: str, limit: int = DEFAULT_MESSAGE_BATCH_SIZE, before: str = "") -> dict[str, Any]:
@@ -2075,6 +2685,13 @@ INDEX_HTML = r"""<!doctype html>
     .path { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color: var(--teal-dark); overflow-wrap: anywhere; }
     .post-meta strong { color: var(--ink); }
     .post-meta a { color: var(--teal-dark); overflow-wrap: anywhere; }
+    .post-meta-title { color: var(--ink); font-weight: 700; overflow-wrap: anywhere; }
+    .post-meta-id { display: block; margin-top: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color: var(--teal-dark); overflow-wrap: anywhere; }
+    .post-meta-grid { display: grid; gap: 6px; margin-top: 8px; }
+    .post-meta-row { display: grid; grid-template-columns: 84px minmax(0, 1fr); gap: 8px; }
+    .post-meta-key { color: var(--muted); }
+    .chip-row { display: flex; flex-wrap: wrap; gap: 5px; }
+    .chip { display: inline-flex; max-width: 100%; border-radius: 999px; padding: 3px 8px; background: rgba(15, 118, 110, 0.11); color: var(--teal-dark); overflow-wrap: anywhere; }
     .category-hits { display: grid; gap: 6px; }
     .category-hit { display: flex; justify-content: space-between; gap: 8px; border-bottom: 1px solid rgba(39, 55, 46, 0.1); padding-bottom: 5px; }
     .category-hit:last-child { border-bottom: 0; padding-bottom: 0; }
@@ -2469,7 +3086,7 @@ INDEX_HTML = r"""<!doctype html>
     function projectLabel(project) {
       const wp = project.wordpress || {};
       const status = wp.post_id ? `${wp.status || "wp"} #${wp.post_id}` : "local";
-      return `${project.title || project.id} · ${status}`;
+      return `${project.id} · ${project.title || "Untitled post"} · ${status}`;
     }
 
     function renderPostProjects(projects, activeId) {
@@ -2494,10 +3111,25 @@ INDEX_HTML = r"""<!doctype html>
         return;
       }
       const wp = project.wordpress || {};
-      const categories = (project.categories || []).join(", ") || "No category yet";
+      const categories = project.categories || [];
       const source = (project.source_sessions || []).length ? `${project.source_sessions.length} chat source(s)` : "No chat source";
-      const link = wp.link ? `<br><a href="${escapeHtml(wp.link)}" target="_blank" rel="noreferrer">${escapeHtml(wp.link)}</a>` : "";
-      $("postProjectMeta").innerHTML = `<strong>${escapeHtml(project.title || project.id)}</strong><br>${escapeHtml(source)} · ${escapeHtml(categories)}<br>${escapeHtml(wp.post_id ? `WordPress ${wp.status || "saved"} #${wp.post_id}` : "Local draft only")}${link}`;
+      const local = project.local_mirror || {};
+      const link = wp.link ? `<a href="${escapeHtml(wp.link)}" target="_blank" rel="noreferrer">${escapeHtml(wp.link)}</a>` : "Not linked";
+      const categoryHtml = categories.length
+        ? `<div class="chip-row">${categories.map((name) => `<span class="chip">${escapeHtml(name)}</span>`).join("")}</div>`
+        : "No category yet";
+      $("postProjectMeta").innerHTML = `
+        <div class="post-meta-title">${escapeHtml(project.title || "Untitled post")}</div>
+        <span class="post-meta-id">${escapeHtml(project.id || "")}</span>
+        <div class="post-meta-grid">
+          <div class="post-meta-row"><span class="post-meta-key">WordPress</span><span>${escapeHtml(wp.post_id ? `#${wp.post_id} · ${wp.status || "saved"}` : "Local draft only")}</span></div>
+          <div class="post-meta-row"><span class="post-meta-key">Categories</span><span>${categoryHtml}</span></div>
+          <div class="post-meta-row"><span class="post-meta-key">Language</span><span>${escapeHtml(project.source_language || "en")}</span></div>
+          <div class="post-meta-row"><span class="post-meta-key">Source</span><span>${escapeHtml(source)}</span></div>
+          <div class="post-meta-row"><span class="post-meta-key">Mirror</span><span>${escapeHtml(local.post_path || "No local mirror linked")}</span></div>
+          <div class="post-meta-row"><span class="post-meta-key">Link</span><span>${link}</span></div>
+        </div>
+      `;
     }
 
     async function loadPostProjects() {
@@ -2703,6 +3335,14 @@ INDEX_HTML = r"""<!doctype html>
         const data = await api("/api/chat", { session_id: state.sessionId, message });
         $("messageInput").value = "";
         renderSession(data);
+        if (data.action_result && data.action_result.status === "executed") {
+          if (data.action_result.action === "select_post") {
+            const resolved = data.action_result.resolved_post || {};
+            $("publishLog").innerHTML = `Selected WordPress post ${escapeHtml(resolved.post_id || "")}: ${escapeHtml(resolved.title || "")}<br><span class="path">${escapeHtml(resolved.local_post_dir || "")}</span>`;
+          } else {
+            $("publishLog").textContent = `Controlled action executed: ${data.action_result.action}`;
+          }
+        }
       } catch (err) {
         $("publishLog").textContent = err.message;
       } finally {
@@ -3355,6 +3995,15 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
                 if parsed.path == "/api/post/select":
                     self.send_json(app.set_active_post_project(str(payload.get("session_id", "")), str(payload.get("post_project_id", ""))))
                     return
+                if parsed.path == "/api/post/select-source":
+                    self.send_json(
+                        app.select_or_import_wordpress_post(
+                            str(payload.get("session_id", "")),
+                            str(payload.get("query") or payload.get("url") or payload.get("post_id") or ""),
+                            sync_mode=str(payload.get("sync_mode") or "pull"),
+                        )
+                    )
+                    return
                 if parsed.path == "/api/post/draft":
                     self.send_json(
                         app.draft_post_project(
@@ -3433,6 +4082,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["low", "medium", "high", "xhigh"],
     )
     parser.add_argument("--codex-timeout", type=int, default=int(os.environ.get("LAZYBLOG_WEBAPP_CODEX_TIMEOUT", "1800")))
+    parser.add_argument("--git-codex-timeout", type=int, default=int(os.environ.get("LAZYBLOG_GIT_CODEX_TIMEOUT", "600")))
     parser.add_argument("--branch", default=os.environ.get("LAZYBLOG_PUSH_BRANCH", "main"))
     parser.add_argument("--commit-push", dest="commit_push", action="store_true", default=bool_env("LAZYBLOG_WEBAPP_COMMIT_PUSH", True))
     parser.add_argument("--no-commit-push", dest="commit_push", action="store_false")
