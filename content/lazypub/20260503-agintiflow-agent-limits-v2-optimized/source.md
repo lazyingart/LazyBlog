@@ -40,7 +40,7 @@ aginti web --port 3210
 
 AgInTiFlow is not meant to be just another chat box. It is a local web-and-CLI agent workspace that starts from a real project folder and keeps the work inspectable.
 
-![AgInTiFlow terminal launch screen](figures/01-cli-launch-clean.jpg)
+![AgInTiFlow terminal launch screen](figures/01-cli-launch-watermark-free.jpg)
 
 *Figure 1. AgInTiFlow starts in the terminal, inside a project folder, with browser, shell, files, Docker, web search, and scout support visible from the beginning.*
 
@@ -84,6 +84,10 @@ The goal is not to replace the terminal with a web app, or replace the web app w
 
 The CLI is for fast interaction. The web app is for visibility: sessions, runtime logs, artifacts, files, screenshots, PDFs, images, settings, and project state.
 
+![AgInTiFlow local web console with conversation and run output](figures/07-web-console-conversation-run-output.jpg)
+
+*Figure 3. The local web UI can continue a selected conversation, show project controls, expose routing settings, and keep run output visible next to the chat. In this screenshot, the session generated a panda image and recorded the artifact path in the assistant response and runtime output.*
+
 ## Cheap Models Change the Architecture
 
 One of the reasons I built this now is DeepSeek.
@@ -99,7 +103,7 @@ DeepSeek V4 changes that equation. It is strong enough and cheap enough that I c
 
 ![AgInTiFlow routing cards](figures/03-routing-cards.jpg)
 
-*Figure 3. The model layer is role-based: route model, main model, spare/wrapper model, and auxiliary models are different jobs, not one vague dropdown.*
+*Figure 4. The model layer is role-based: route model, main model, spare/wrapper model, and auxiliary models are different jobs, not one vague dropdown.*
 
 This matters because a good local agent should not depend on one model identity. Some tasks need speed. Some need context. Some need tool discipline. Some need a different policy profile. Some need image generation. Some need a cheap scout model to inspect a corner of the codebase before the main model acts.
 
@@ -129,7 +133,7 @@ I want AgInTiFlow to be more artifact-centered. If it builds something, there sh
 
 ![Canvas and PDF artifact view](figures/04-web-canvas-artifacts.jpg)
 
-*Figure 4. The local web app can inspect generated artifacts such as PDFs, images, and canvas outputs from the same project session.*
+*Figure 5. The local web app can inspect generated artifacts such as PDFs, images, and canvas outputs from the same project session.*
 
 This is also why the web UI matters. A terminal transcript is not enough for every kind of work. When the task produces visual artifacts, the inspection surface should be visual too.
 
@@ -166,7 +170,7 @@ The point is not just to supervise one task. The point is to improve the agent a
 
 ![Android app built and verified through a supervised AgInTiFlow task](figures/05-android-supervision-emulator.jpg)
 
-*Figure 5. A supervised Android task built a Kotlin/Jetpack Compose tip-splitting app, ran tests, installed it on an emulator, captured evidence, and committed the result.*
+*Figure 6. A supervised Android task built a Kotlin/Jetpack Compose tip-splitting app, ran tests, installed it on an emulator, captured evidence, and committed the result.*
 
 This is the kind of loop I care about: not "write code" in the abstract, but build, test, install, inspect, screenshot, and commit.
 
@@ -215,7 +219,7 @@ AgInTiFlow is still evolving, but it already supports a useful set of local work
 
 ![AgInTiFlow package on npm](figures/06-npm-package-page.jpg)
 
-*Figure 6. AgInTiFlow is distributed through npm so it can be installed quickly on a local machine.*
+*Figure 7. AgInTiFlow is distributed through npm so it can be installed quickly on a local machine.*
 
 ## What I Am Still Improving
 
@@ -261,4 +265,3 @@ aginti
 The product idea is simple:
 
 Agents should flow through your work, but the work should remain yours, local, inspectable, and verifiable.
-
