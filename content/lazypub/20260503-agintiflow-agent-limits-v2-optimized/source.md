@@ -21,9 +21,9 @@ Sometimes the limit was cost. Sometimes it was context. Sometimes it was a sessi
 
 So I started building my own agent workspace: **AgInTiFlow**.
 
-- GitHub: <https://github.com/lazyingart/AgInTiFlow>
-- npm: <https://www.npmjs.com/package/@lazyingart/agintiflow>
-- Website: <https://flow.lazying.art>
+- GitHub: [https://github.com/lazyingart/AgInTiFlow](https://github.com/lazyingart/AgInTiFlow)
+- npm: [https://www.npmjs.com/package/@lazyingart/agintiflow](https://www.npmjs.com/package/@lazyingart/agintiflow)
+- Website: [https://flow.lazying.art](https://flow.lazying.art)
 
 Install:
 
@@ -178,7 +178,7 @@ This is the kind of loop I care about: not "write code" in the abstract, but bui
 
 AgInTiFlow also connects to a broader project I am building called **AAPS**:
 
-- npm: <https://www.npmjs.com/package/@lazyingart/aaps>
+- npm: [https://www.npmjs.com/package/@lazyingart/aaps](https://www.npmjs.com/package/@lazyingart/aaps)
 
 AAPS stands for Autonomous Agentic Pipeline Script. Its philosophy is simple:
 
@@ -253,9 +253,9 @@ It is still young, but it is already useful enough that I am using it to build i
 
 Try it here:
 
-- GitHub: <https://github.com/lazyingart/AgInTiFlow>
-- npm: <https://www.npmjs.com/package/@lazyingart/agintiflow>
-- AAPS: <https://www.npmjs.com/package/@lazyingart/aaps>
+- GitHub: [https://github.com/lazyingart/AgInTiFlow](https://github.com/lazyingart/AgInTiFlow)
+- npm: [https://www.npmjs.com/package/@lazyingart/agintiflow](https://www.npmjs.com/package/@lazyingart/agintiflow)
+- AAPS: [https://www.npmjs.com/package/@lazyingart/aaps](https://www.npmjs.com/package/@lazyingart/aaps)
 
 ```bash
 npm install -g @lazyingart/agintiflow
