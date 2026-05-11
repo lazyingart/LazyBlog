@@ -53,14 +53,25 @@ if [ -f .env ]; then
   source .env
 fi
 set +a
-exec "$PYTHON_BIN" scripts/lazyblog_webapp.py \
+"$PYTHON_BIN" scripts/lazyblog_webapp.py \
   --host "\${LAZYBLOG_WEBAPP_HOST:-$DEFAULT_HOST}" \
   --port "\${LAZYBLOG_WEBAPP_PORT:-$DEFAULT_PORT}" \
   --model "\${LAZYBLOG_WEBAPP_MODEL:-$DEFAULT_MODEL}" \
   --reasoning "\${LAZYBLOG_WEBAPP_REASONING:-$DEFAULT_REASONING}"
+status=\$?
+echo "LazyBlog Studio exited with status \$status. Fix the issue above, then rerun this pane."
+exec bash
 EOF
 
-tmux new-session -d -s "$SESSION_NAME" "bash -lc $(printf '%q' "$INNER_COMMAND")"
+SAFE_SESSION_NAME="${SESSION_NAME//[^A-Za-z0-9_.-]/_}"
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+WEBAPP_RUN_SCRIPT="$RUN_DIR/lazyblog-${SAFE_SESSION_NAME}-webapp.sh"
+NGROK_RUN_SCRIPT="$RUN_DIR/lazyblog-${SAFE_SESSION_NAME}-ngrok.sh"
+
+printf '%s\n' "$INNER_COMMAND" > "$WEBAPP_RUN_SCRIPT"
+chmod 700 "$WEBAPP_RUN_SCRIPT"
+
+tmux new-session -d -s "$SESSION_NAME" -c "$ROOT_DIR" "bash \"$WEBAPP_RUN_SCRIPT\""
 
 if [ -n "$NGROK_URL" ]; then
   read -r -d '' NGROK_COMMAND <<EOF || true
@@ -85,7 +96,9 @@ status=\$?
 echo "ngrok exited with status \$status. Fix the issue above, then rerun the same command from this pane."
 exec bash
 EOF
-  tmux split-window -h -t "$SESSION_NAME":0 "bash -lc $(printf '%q' "$NGROK_COMMAND")"
+  printf '%s\n' "$NGROK_COMMAND" > "$NGROK_RUN_SCRIPT"
+  chmod 700 "$NGROK_RUN_SCRIPT"
+  tmux split-window -h -t "$SESSION_NAME":0 -c "$ROOT_DIR" "bash \"$NGROK_RUN_SCRIPT\""
   tmux select-layout -t "$SESSION_NAME":0 even-horizontal >/dev/null
   echo "Ngrok pane is forwarding https://$NGROK_URL -> http://127.0.0.1:$DEFAULT_PORT"
 fi
