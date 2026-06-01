@@ -470,9 +470,20 @@ def guess_content_type(path_or_url: str, fallback: str = "application/octet-stre
     return guessed or fallback
 
 
-def candidate_filename(raw_url: str, local_path: Path | None) -> str:
+def unique_local_media_filename(filename: str, post_dir: Path) -> str:
+    path = Path(filename)
+    stem = sanitize_slug(path.stem) or "media"
+    suffix = path.suffix.lower() or ".bin"
+    prefix = sanitize_slug(post_dir.name)
+    if prefix and not stem.startswith(prefix):
+        stem = f"{prefix}-{stem}"
+    return f"{stem}{suffix}"
+
+
+def candidate_filename(raw_url: str, local_path: Path | None, post_dir: Path | None = None) -> str:
     if local_path is not None:
-        return local_path.name
+        filename = local_path.name
+        return unique_local_media_filename(filename, post_dir) if post_dir is not None else filename
     parsed = urllib.parse.urlparse(raw_url)
     return Path(urllib.parse.unquote(parsed.path)).name or sanitize_slug(raw_url) + ".bin"
 
@@ -542,7 +553,7 @@ def migrate_markdown_media(
             append_media_log(post_dir, {"file": str(markdown_path), "url": raw_url, "status": "already-mapped"})
             continue
 
-        filename = candidate_filename(resolved_url, local_path)
+        filename = candidate_filename(resolved_url, local_path, post_dir)
         if apply:
             existing_url = client.find_media_by_filename(filename)
             if existing_url:
