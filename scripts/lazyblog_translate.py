@@ -139,6 +139,90 @@ def convert_inline_markdown(text: str) -> str:
     return escaped
 
 
+def split_markdown_table_row(line: str) -> list[str] | None:
+    stripped = line.strip()
+    if "|" not in stripped:
+        return None
+
+    chars = list(stripped)
+    if chars and chars[0] == "|":
+        chars = chars[1:]
+    if chars and chars[-1] == "|" and (len(chars) < 2 or chars[-2] != "\\"):
+        chars = chars[:-1]
+
+    cells: list[str] = []
+    current: list[str] = []
+    escaped = False
+    in_code = False
+    for char in chars:
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+        if char == "\\":
+            current.append(char)
+            escaped = True
+            continue
+        if char == "`":
+            in_code = not in_code
+            current.append(char)
+            continue
+        if char == "|" and not in_code:
+            cells.append("".join(current).strip())
+            current = []
+            continue
+        current.append(char)
+
+    cells.append("".join(current).strip())
+    if len(cells) < 2:
+        return None
+    return cells
+
+
+def markdown_table_alignments(line: str, column_count: int) -> list[str] | None:
+    cells = split_markdown_table_row(line)
+    if not cells or len(cells) != column_count:
+        return None
+
+    alignments: list[str] = []
+    for cell in cells:
+        marker = re.sub(r"\s+", "", cell)
+        if not marker:
+            return None
+        body = marker.strip(":")
+        if not body or any(char not in "-—–─" for char in body):
+            return None
+        if marker.startswith(":") and marker.endswith(":"):
+            alignments.append("center")
+        elif marker.endswith(":"):
+            alignments.append("right")
+        elif marker.startswith(":"):
+            alignments.append("left")
+        else:
+            alignments.append("")
+    return alignments
+
+
+def render_markdown_table(headers: list[str], alignments: list[str], rows: list[list[str]]) -> str:
+    def align_attr(index: int) -> str:
+        if index >= len(alignments) or not alignments[index]:
+            return ""
+        return f' style="text-align: {alignments[index]};"'
+
+    thead = "<thead><tr>" + "".join(
+        f"<th{align_attr(index)}>{convert_inline_markdown(cell)}</th>"
+        for index, cell in enumerate(headers)
+    ) + "</tr></thead>"
+    tbody = "<tbody>\n" + "\n".join(
+        "<tr>" + "".join(
+            f"<td{align_attr(index)}>{convert_inline_markdown(cell)}</td>"
+            for index, cell in enumerate(row)
+        ) + "</tr>"
+        for row in rows
+    ) + "\n</tbody>"
+    return '<figure class="wp-block-table"><table>' + thead + "\n" + tbody + "</table></figure>"
+
+
 def markdown_to_html(markdown: str) -> str:
     _, body = split_front_matter(markdown)
     lines = body.splitlines()
@@ -169,7 +253,9 @@ def markdown_to_html(markdown: str) -> str:
             output.append("<ol>\n" + "\n".join(f"<li>{item}</li>" for item in ordered_items) + "\n</ol>")
             ordered_items = []
 
-    for line in lines:
+    idx = 0
+    while idx < len(lines):
+        line = lines[idx]
         if math_end is not None:
             if line.strip() == math_end:
                 formula = html.escape("\n".join(math_lines), quote=False)
@@ -178,6 +264,7 @@ def markdown_to_html(markdown: str) -> str:
                 math_end = None
             else:
                 math_lines.append(line)
+            idx += 1
             continue
 
         if line.startswith("```"):
@@ -190,10 +277,12 @@ def markdown_to_html(markdown: str) -> str:
                 flush_list()
                 flush_ordered()
                 in_code = True
+            idx += 1
             continue
 
         if in_code:
             code_lines.append(line)
+            idx += 1
             continue
 
         if line.strip() in {"\\[", "$$"}:
@@ -202,13 +291,33 @@ def markdown_to_html(markdown: str) -> str:
             flush_ordered()
             math_end = "\\]" if line.strip() == "\\[" else "$$"
             math_lines = []
+            idx += 1
             continue
 
         if not line.strip():
             flush_paragraph()
             flush_list()
             flush_ordered()
+            idx += 1
             continue
+
+        header_cells = split_markdown_table_row(line)
+        if header_cells and idx + 1 < len(lines):
+            alignments = markdown_table_alignments(lines[idx + 1], len(header_cells))
+            if alignments is not None:
+                flush_paragraph()
+                flush_list()
+                flush_ordered()
+                idx += 2
+                rows: list[list[str]] = []
+                while idx < len(lines):
+                    row_cells = split_markdown_table_row(lines[idx])
+                    if not row_cells or len(row_cells) != len(header_cells):
+                        break
+                    rows.append(row_cells)
+                    idx += 1
+                output.append(render_markdown_table(header_cells, alignments, rows))
+                continue
 
         heading = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
         if heading:
@@ -217,6 +326,7 @@ def markdown_to_html(markdown: str) -> str:
             flush_ordered()
             level = len(heading.group(1))
             output.append(f"<h{level}>{convert_inline_markdown(heading.group(2))}</h{level}>")
+            idx += 1
             continue
 
         unordered = re.match(r"^\s*[-*]\s+(.+?)\s*$", line)
@@ -224,6 +334,7 @@ def markdown_to_html(markdown: str) -> str:
             flush_paragraph()
             flush_ordered()
             list_items.append(convert_inline_markdown(unordered.group(1)))
+            idx += 1
             continue
 
         ordered = re.match(r"^\s*\d+\.\s+(.+?)\s*$", line)
@@ -231,6 +342,7 @@ def markdown_to_html(markdown: str) -> str:
             flush_paragraph()
             flush_list()
             ordered_items.append(convert_inline_markdown(ordered.group(1)))
+            idx += 1
             continue
 
         if line.startswith("> "):
@@ -238,9 +350,11 @@ def markdown_to_html(markdown: str) -> str:
             flush_list()
             flush_ordered()
             output.append("<blockquote><p>" + convert_inline_markdown(line[2:].strip()) + "</p></blockquote>")
+            idx += 1
             continue
 
         paragraph.append(line)
+        idx += 1
 
     if in_code:
         output.append("<pre><code>" + html.escape("\n".join(code_lines)) + "</code></pre>")

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import re
@@ -176,12 +177,34 @@ def find_or_create_term(client: WPClient, endpoint: str, name: str, create: bool
     if name.isdigit():
         return int(name)
 
-    query = f"search={client_quote(name)}&per_page=100&context=edit"
-    rows = client.request("GET", f"/wp-json/wp/v2/{endpoint}?{query}")
-    if isinstance(rows, list):
+    wanted = html.unescape(name).strip().lower()
+
+    def exact_match(rows: Any) -> int | None:
+        if not isinstance(rows, list):
+            return None
         for row in rows:
-            if isinstance(row, dict) and str(row.get("name", "")).strip().lower() == name.strip().lower():
+            row_name = html.unescape(str(row.get("name", ""))).strip().lower() if isinstance(row, dict) else ""
+            if row_name == wanted:
                 return int(row["id"])
+        return None
+
+    search_terms = [name]
+    escaped_name = html.escape(name, quote=False)
+    if escaped_name != name:
+        search_terms.append(escaped_name)
+    for search_term in search_terms:
+        query = f"search={client_quote(search_term)}&per_page=100&context=edit"
+        term_id = exact_match(client.request("GET", f"/wp-json/wp/v2/{endpoint}?{query}"))
+        if term_id is not None:
+            return term_id
+
+    for page in range(1, 11):
+        rows = client.request("GET", f"/wp-json/wp/v2/{endpoint}?per_page=100&context=edit&page={page}")
+        term_id = exact_match(rows)
+        if term_id is not None:
+            return term_id
+        if not isinstance(rows, list) or len(rows) < 100:
+            break
 
     if not create:
         raise LazyBlogError(f"{endpoint[:-1]} not found and --no-create-terms was used: {name}")
@@ -295,14 +318,16 @@ def copy_inputs_to_archive(
 ) -> tuple[Path, list[tuple[str | None, Path]]]:
     archive_dir.mkdir(parents=True, exist_ok=True)
     source_target = archive_dir / "post.md"
-    shutil.copyfile(source, source_target)
+    if source.resolve() != source_target.resolve():
+        shutil.copyfile(source, source_target)
     copied_translations: list[tuple[str | None, Path]] = []
     translation_root = archive_dir / "translations"
     translation_root.mkdir(parents=True, exist_ok=True)
     for language, path in translations:
         target_name = f"{language or path.stem}.md"
         target = translation_root / target_name
-        shutil.copyfile(path, target)
+        if path.resolve() != target.resolve():
+            shutil.copyfile(path, target)
         copied_translations.append((language, target))
     return source_target, copied_translations
 
