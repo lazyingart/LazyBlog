@@ -127,6 +127,13 @@ is backed up immediately in the browser and synchronized to an atomic server
 draft. Server-sent events propagate draft changes to other logged-in devices,
 while version conflicts are preserved instead of silently overwriting text.
 
+The native microphone provides fast composer dictation; long-press opens a
+device-persistent language chooser. A separate audio-message control retains a
+complete recording in IndexedDB before upload and can hand it to an optional
+server-side Whisper `large-v3` API. The browser receives no model credential,
+and accepted recordings continue through transcription and the normal chat
+queue after refresh or browser closure.
+
 Prompt profiles default to `gpt-5.6-sol` with low reasoning. An optional
 AgentShell route can try several local account profiles in order, retry with
 `gpt-5.3-codex-spark`, and finally use AgInTi with DeepSeek when that hosted

@@ -6,6 +6,7 @@ import base64
 import hashlib
 import hmac
 import html
+import http.client
 import io
 import json
 import mimetypes
@@ -74,6 +75,7 @@ DEFAULT_GIT_MODEL = "gpt-5.3-codex-spark"
 DEFAULT_GIT_REASONING = "medium"
 DEFAULT_MESSAGE_BATCH_SIZE = 10
 MAX_COMPOSER_TEXT_CHARS = 250_000
+MAX_AUDIO_MESSAGE_BYTES = 100 * 1024 * 1024
 MAX_ARTIFACT_TEXT_BYTES = 520_000
 MAX_ARTIFACT_BINARY_BYTES = 8_000_000
 ARTIFACT_ALLOWED_PREFIXES = (
@@ -687,13 +689,19 @@ class LazyBlogStudio:
         self.artifact_lock = threading.Lock()
         self.chat_queue_lock = threading.Lock()
         self.composer_lock = threading.Lock()
+        self.message_lock = threading.Lock()
+        self.audio_job_lock = threading.Lock()
         self.chat_queue_event = threading.Event()
+        self.audio_job_event = threading.Event()
         self.event_lock = threading.Condition()
         self.event_seq = 0
         self.events: deque[dict[str, Any]] = deque(maxlen=500)
         self.reset_stale_chat_queue_items()
+        self.reset_stale_audio_jobs()
         self.chat_queue_thread = threading.Thread(target=self.chat_queue_loop, daemon=True)
         self.chat_queue_thread.start()
+        self.audio_job_thread = threading.Thread(target=self.audio_job_loop, daemon=True)
+        self.audio_job_thread.start()
 
     def new_session_id(self) -> str:
         return f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
@@ -1543,6 +1551,416 @@ Rules:
         path.write_bytes(blob)
         return str(path.relative_to(ROOT_DIR))
 
+    def audio_job_dir(self, session_id: str) -> Path:
+        return self.session_dir(safe_session_id(session_id)) / "audio-jobs"
+
+    def audio_job_path(self, session_id: str, job_id: str) -> Path:
+        return self.audio_job_dir(session_id) / f"{safe_job_id(job_id)}.json"
+
+    def read_audio_job(self, session_id: str, job_id: str) -> dict[str, Any]:
+        path = self.audio_job_path(session_id, job_id)
+        if not path.is_file():
+            raise WebAppError(f"unknown audio job: {job_id}")
+        return read_json(path)
+
+    def find_audio_job(self, job_id: str) -> tuple[Path, dict[str, Any]]:
+        safe_id = safe_job_id(job_id)
+        matches = list(CHAT_ROOT.glob(f"*/audio-jobs/{safe_id}.json"))
+        if not matches:
+            raise WebAppError(f"unknown audio job: {safe_id}")
+        return matches[0], read_json(matches[0])
+
+    def write_audio_job(self, job: dict[str, Any]) -> dict[str, Any]:
+        job["updated_at"] = now_iso()
+        write_json(self.audio_job_path(str(job["session_id"]), str(job["id"])), job)
+        self.emit_event(
+            "session_updated",
+            str(job["session_id"]),
+            {"session_id": str(job["session_id"]), "audio_job_id": str(job["id"]), "audio_status": str(job.get("status") or "")},
+        )
+        return job
+
+    def update_audio_job(self, job: dict[str, Any], **changes: Any) -> dict[str, Any]:
+        with self.audio_job_lock:
+            current = self.read_audio_job(str(job["session_id"]), str(job["id"]))
+            current.update(changes)
+            return self.write_audio_job(current)
+
+    def audio_jobs(self, statuses: set[str] | None = None) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for path in CHAT_ROOT.glob("*/audio-jobs/*.json"):
+            try:
+                job = read_json(path)
+            except json.JSONDecodeError:
+                continue
+            if statuses and str(job.get("status") or "") not in statuses:
+                continue
+            rows.append(job)
+        return sorted(rows, key=lambda row: (str(row.get("created_at") or ""), str(row.get("id") or "")))
+
+    def reset_stale_audio_jobs(self) -> None:
+        for job in self.audio_jobs(statuses={"submitting"}):
+            job["status"] = "queued"
+            job["requeued_after_restart"] = True
+            self.write_audio_job(job)
+
+    def existing_audio_idempotency(self, key: str) -> dict[str, Any] | None:
+        if not key:
+            return None
+        for job in self.audio_jobs():
+            if hmac.compare_digest(str(job.get("idempotency_key") or ""), key):
+                return job
+        return None
+
+    def accept_audio_message(self, stream: Any, headers: Any) -> dict[str, Any]:
+        try:
+            content_length = int(headers.get("Content-Length", "0") or "0")
+        except ValueError as exc:
+            raise WebAppError("invalid audio Content-Length") from exc
+        max_bytes = max(1, int(os.environ.get("LAZYBLOG_AUDIO_MAX_MIB", "100"))) * 1024 * 1024
+        if content_length <= 0:
+            raise WebAppError("audio body is empty")
+        if content_length > max_bytes:
+            raise WebAppError("audio message exceeds the configured upload limit")
+
+        idempotency_key = str(headers.get("X-Idempotency-Key", "")).strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{8,160}", idempotency_key):
+            raise WebAppError("valid X-Idempotency-Key is required")
+        existing = self.existing_audio_idempotency(idempotency_key)
+        if existing:
+            payload = self.session_payload(str(existing["session_id"]))
+            payload["audio_job"] = self.public_audio_job(existing)
+            payload["reused"] = True
+            return payload
+
+        requested_session = str(headers.get("X-Session-ID", "")).strip()
+        session = self.load_session(safe_session_id(requested_session)) if requested_session else self.create_session("Voice message")
+        session_id = str(session["id"])
+        job_id = f"{stamp()}-{uuid.uuid4().hex[:8]}-audio"
+        filename = Path(str(headers.get("X-Filename", "voice.webm")) or "voice.webm").name
+        content_type = str(headers.get("Content-Type", "application/octet-stream")).split(";", 1)[0].strip().lower()
+        suffix = extension_for_mime(content_type, filename)
+        if suffix.lower() not in {".aac", ".flac", ".m4a", ".mp3", ".mp4", ".ogg", ".opus", ".wav", ".webm"}:
+            suffix = ".webm"
+        target_dir = self.attachment_storage_dir(session_id, job_id)
+        target_dir.mkdir(parents=True, exist_ok=False)
+        audio_path = target_dir / f"voice{suffix}"
+        remaining = content_length
+        digest = hashlib.sha256()
+        try:
+            with audio_path.open("wb") as handle:
+                while remaining:
+                    chunk = stream.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise WebAppError("audio upload ended before Content-Length bytes were received")
+                    handle.write(chunk)
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except Exception:
+            shutil.rmtree(target_dir, ignore_errors=True)
+            raise
+
+        stored_path = str(audio_path.relative_to(ROOT_DIR))
+        attachment = {
+            "name": filename,
+            "kind": "audio",
+            "mime": content_type or "application/octet-stream",
+            "size": content_length,
+            "data_url": "",
+            "stored_path": stored_path,
+            "preview_url": f"/api/audio/content?id={urllib.parse.quote(job_id)}",
+            "preview_kind": "audio",
+            "analysis_markdown": "",
+            "analysis_note": "Queued for multilingual Whisper large-v3 transcription.",
+            "analysis_source": "localstt:large-v3",
+            "analysis_status": "queued",
+            "visible_language": "",
+            "text_excerpt": "",
+            "page_count": 0,
+            "duration_seconds": 0,
+            "width": 0,
+            "height": 0,
+            "audio_job_id": job_id,
+            "language": "",
+            "diarization_status": "pending",
+            "summary": "",
+        }
+        message_path = self.append_message(
+            session_id,
+            "user",
+            "*Audio message is being transcribed with Whisper large-v3.*",
+            {
+                "queue_id": "",
+                "queue_status": "transcribing",
+                "audio_job_id": job_id,
+                "attachments_json": json.dumps([attachment], ensure_ascii=False),
+            },
+        )
+        job = {
+            "id": job_id,
+            "session_id": session_id,
+            "status": "queued",
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+            "idempotency_key": idempotency_key,
+            "filename": filename,
+            "content_type": content_type,
+            "bytes": content_length,
+            "sha256": digest.hexdigest(),
+            "stored_path": stored_path,
+            "message_path": str(message_path.relative_to(ROOT_DIR)),
+            "language_hint": str(headers.get("X-Language", "auto") or "auto"),
+            "diarize": str(headers.get("X-Diarize", "auto") or "auto"),
+            "remote_job_id": "",
+            "attempts": 0,
+            "remote_retries": 0,
+            "next_attempt_at": 0,
+            "error": "",
+        }
+        self.write_audio_job(job)
+        self.audio_job_event.set()
+        payload = self.session_payload(session_id)
+        payload["audio_job"] = self.public_audio_job(job)
+        payload["reused"] = False
+        return payload
+
+    def public_audio_job(self, job: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: job.get(key)
+            for key in (
+                "id", "session_id", "status", "created_at", "updated_at", "filename", "bytes",
+                "language", "duration", "summary", "error", "remote_job_id",
+            )
+        }
+
+    def localstt_request(self, method: str, route: str, body_path: Path | None = None, headers: dict[str, str] | None = None) -> dict[str, Any]:
+        base_url = os.environ.get("LOCALSTT_API_URL", "http://127.0.0.1:10600").strip().rstrip("/")
+        token = os.environ.get("LOCALSTT_API_TOKEN", "").strip()
+        if len(token) < 32:
+            raise WebAppError("LOCALSTT_API_TOKEN is not configured")
+        parsed = urllib.parse.urlparse(base_url)
+        if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+            raise WebAppError("LOCALSTT_API_URL must be a loopback HTTP endpoint")
+        connection = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=35)
+        request_headers = {"Authorization": f"Bearer {token}", "Accept": "application/json", **(headers or {})}
+        try:
+            if body_path:
+                request_headers["Content-Length"] = str(body_path.stat().st_size)
+                connection.putrequest(method, f"{parsed.path.rstrip('/')}{route}" or route)
+                for name, value in request_headers.items():
+                    connection.putheader(name, value)
+                connection.endheaders()
+                with body_path.open("rb") as handle:
+                    while chunk := handle.read(1024 * 1024):
+                        connection.send(chunk)
+            else:
+                connection.request(method, f"{parsed.path.rstrip('/')}{route}" or route, headers=request_headers)
+            response = connection.getresponse()
+            raw = response.read()
+            try:
+                payload = json.loads(raw.decode("utf-8")) if raw else {}
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise WebAppError(f"LocalSTT returned invalid JSON ({response.status})") from exc
+            if response.status >= 400:
+                detail = payload.get("detail") or payload.get("error") or response.reason
+                if isinstance(detail, dict):
+                    detail = detail.get("message") or detail.get("code") or json.dumps(detail, ensure_ascii=False)
+                raise WebAppError(f"LocalSTT {response.status}: {detail}")
+            return payload
+        finally:
+            connection.close()
+
+    def next_audio_job(self) -> dict[str, Any] | None:
+        now = time.time()
+        for job in self.audio_jobs(statuses={"queued", "transcribing", "waiting_service"}):
+            if float(job.get("next_attempt_at") or 0) <= now:
+                return job
+        return None
+
+    def audio_job_loop(self) -> None:
+        while True:
+            job = self.next_audio_job()
+            if job is None:
+                self.audio_job_event.wait(timeout=3.0)
+                self.audio_job_event.clear()
+                continue
+            try:
+                self.process_audio_job(job)
+            except Exception as exc:  # noqa: BLE001
+                traceback.print_exc()
+                attempts = int(job.get("attempts") or 0) + 1
+                delay = min(120, 5 * (2 ** min(attempts - 1, 4)))
+                self.update_audio_job(
+                    job,
+                    status="waiting_service",
+                    attempts=attempts,
+                    next_attempt_at=time.time() + delay,
+                    error=str(exc)[:500],
+                )
+
+    def process_audio_job(self, job: dict[str, Any]) -> None:
+        remote_job_id = str(job.get("remote_job_id") or "")
+        if not remote_job_id:
+            job = self.update_audio_job(job, status="submitting", error="")
+            source = (ROOT_DIR / str(job["stored_path"])).resolve()
+            if not source.is_file() or UPLOAD_ROOT.resolve() not in source.parents:
+                raise WebAppError("retained audio file is unavailable")
+            payload = self.localstt_request(
+                "POST",
+                "/v1/transcriptions",
+                body_path=source,
+                headers={
+                    "Content-Type": str(job.get("content_type") or "application/octet-stream"),
+                    "X-Filename": str(job.get("filename") or source.name),
+                    "X-Language": str(job.get("language_hint") or "auto"),
+                    "X-Diarize": str(job.get("diarize") or "auto"),
+                    "X-Idempotency-Key": f"lazyblog:{job['id']}",
+                },
+            )
+            remote = payload.get("job") if isinstance(payload.get("job"), dict) else payload
+            remote_job_id = str(remote.get("id") or "")
+            if not remote_job_id:
+                raise WebAppError("LocalSTT did not return a job id")
+            job = self.update_audio_job(job, status="transcribing", remote_job_id=remote_job_id, next_attempt_at=time.time() + 2, error="")
+            return
+
+        payload = self.localstt_request("GET", f"/v1/transcriptions/{urllib.parse.quote(remote_job_id)}")
+        remote = payload.get("job") if isinstance(payload.get("job"), dict) else payload
+        remote_status = str(remote.get("status") or "")
+        if remote_status == "failed":
+            remote_retries = int(job.get("remote_retries") or 0)
+            if remote_retries < 2:
+                self.localstt_request("POST", f"/v1/transcriptions/{urllib.parse.quote(remote_job_id)}/retry")
+                self.update_audio_job(job, status="transcribing", remote_retries=remote_retries + 1, next_attempt_at=time.time() + 5, error="")
+                return
+            self.fail_audio_job(job, str(remote.get("error") or "LocalSTT transcription failed"))
+            return
+        if remote_status != "succeeded":
+            self.update_audio_job(job, status="transcribing", next_attempt_at=time.time() + 2, error="")
+            return
+        result = remote.get("result") if isinstance(remote.get("result"), dict) else {}
+        self.finalize_audio_job(job, result)
+
+    def finalize_audio_job(self, job: dict[str, Any], result: dict[str, Any]) -> None:
+        transcript = str(result.get("text") or "").strip()
+        message_text = transcript or "[Audio message contained no detectable speech.]"
+        message_path = (ROOT_DIR / str(job["message_path"])).resolve()
+        if not message_path.is_file() or CHAT_ROOT.resolve() not in message_path.parents:
+            raise WebAppError("audio message record is unavailable")
+        front_matter, _body = split_front_matter(message_path.read_text(encoding="utf-8"))
+        attachments = self.parse_attachments_json(front_matter.get("attachments_json"))
+        attachment = attachments[0] if attachments else {}
+        diarization = result.get("diarization") if isinstance(result.get("diarization"), dict) else {}
+        attachment.update(
+            {
+                "analysis_note": f"Transcribed with Whisper {result.get('model') or 'large-v3'} ({result.get('language') or 'unknown'}).",
+                "analysis_source": "localstt:large-v3",
+                "analysis_status": "succeeded",
+                "text_excerpt": transcript[:6000],
+                "duration_seconds": float(result.get("duration") or 0),
+                "language": str(result.get("language") or "unknown"),
+                "diarization_status": str(diarization.get("status") or "not-requested"),
+                "summary": str(result.get("summary") or ""),
+            }
+        )
+        mirror_dir = UPLOAD_MIRROR_ROOT / safe_session_id(str(job["session_id"])) / safe_job_id(str(job["id"]))
+        mirror_path = mirror_dir / "audio-transcript.md"
+        transcript_lines = [
+            "# Audio Message Transcript",
+            "",
+            f"- Model: `{result.get('model') or 'large-v3'}`",
+            f"- Language: `{result.get('language') or 'unknown'}`",
+            f"- Duration: `{float(result.get('duration') or 0):.2f}s`",
+            f"- Diarization: `{diarization.get('status') or 'not-requested'}`",
+            "",
+            "## Summary",
+            "",
+            str(result.get("summary") or message_text),
+            "",
+            "## Full Transcript",
+            "",
+            message_text,
+            "",
+        ]
+        mirror_path.parent.mkdir(parents=True, exist_ok=True)
+        mirror_path.write_text("\n".join(transcript_lines), encoding="utf-8")
+        attachment["mirror_markdown_path"] = str(mirror_path.relative_to(ROOT_DIR))
+        attachment["analysis_markdown"] = "\n".join(transcript_lines[:12]).strip()
+        queue_id = f"{stamp()}-{uuid.uuid4().hex[:8]}-chat"
+        front_matter.update(
+            {
+                "queue_id": queue_id,
+                "queue_status": "queued",
+                "transcribed_at": now_iso(),
+                "attachments_json": json.dumps([attachment], ensure_ascii=False),
+            }
+        )
+        with self.message_lock:
+            write_markdown(message_path, front_matter, message_text)
+        queue_item = {
+            "id": queue_id,
+            "session_id": str(job["session_id"]),
+            "status": "queued",
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+            "started_at": None,
+            "finished_at": None,
+            "message": message_text,
+            "user_message_path": str(message_path.relative_to(ROOT_DIR)),
+            "assistant_message_path": "",
+            "attachment_analysis_status": "succeeded",
+            "attachments_preanalyzed": True,
+            "action_result": None,
+            "error": "",
+        }
+        self.write_chat_queue_item(queue_item)
+        completed = self.update_audio_job(
+            job,
+            status="succeeded",
+            completed_at=now_iso(),
+            language=str(result.get("language") or "unknown"),
+            duration=float(result.get("duration") or 0),
+            summary=str(result.get("summary") or ""),
+            transcript_mirror=str(mirror_path.relative_to(ROOT_DIR)),
+            chat_queue_id=queue_id,
+            next_attempt_at=0,
+            error="",
+        )
+        self.save_session(str(job["session_id"]), self.load_session(str(job["session_id"])))
+        self.chat_queue_event.set()
+        self.emit_event("session_updated", str(job["session_id"]), {"session_id": str(job["session_id"]), "audio_job_id": completed["id"], "audio_status": "succeeded"})
+
+    def fail_audio_job(self, job: dict[str, Any], error: str) -> None:
+        message_path = (ROOT_DIR / str(job["message_path"])).resolve()
+        if message_path.is_file() and CHAT_ROOT.resolve() in message_path.parents:
+            front_matter, body = split_front_matter(message_path.read_text(encoding="utf-8"))
+            attachments = self.parse_attachments_json(front_matter.get("attachments_json"))
+            if attachments:
+                attachments[0]["analysis_status"] = "failed"
+                attachments[0]["analysis_note"] = error[:500]
+                front_matter["attachments_json"] = json.dumps(attachments, ensure_ascii=False)
+            front_matter["queue_status"] = "failed"
+            front_matter["error"] = error[:500]
+            with self.message_lock:
+                write_markdown(message_path, front_matter, body)
+        self.update_audio_job(
+            job,
+            status="failed",
+            failed_at=now_iso(),
+            next_attempt_at=0,
+            error=error[:500],
+        )
+
+    def retry_audio_job(self, job_id: str) -> dict[str, Any]:
+        _path, job = self.find_audio_job(job_id)
+        if str(job.get("status") or "") in {"queued", "submitting", "transcribing", "waiting_service"}:
+            return {"audio_job": self.public_audio_job(job)}
+        job = self.update_audio_job(job, status="queued", remote_job_id="", remote_retries=0, next_attempt_at=0, error="")
+        self.audio_job_event.set()
+        return {"audio_job": self.public_audio_job(job)}
+
     def attachment_mirror_dir(self, session_id: str, queue_id: str) -> Path:
         return UPLOAD_MIRROR_ROOT / safe_session_id(session_id) / safe_job_id(queue_id or "manual")
 
@@ -1828,6 +2246,42 @@ Rules:
             data_url = str(raw.get("data_url", "")).strip()
             stored_path = str(raw.get("stored_path", "")).strip()
             stored_file = (ROOT_DIR / stored_path).resolve() if stored_path else None
+            mime = str(raw.get("mime", raw.get("mime_type", "application/octet-stream"))).strip() or "application/octet-stream"
+            name = str(raw.get("name", "attachment")).strip() or "attachment"
+            kind = str(raw.get("kind", "")).strip().lower()
+            if (kind == "audio" or mime.startswith("audio/")) and stored_file:
+                try:
+                    trusted_audio = stored_file.is_file() and UPLOAD_ROOT.resolve() in stored_file.parents
+                except OSError:
+                    trusted_audio = False
+                if trusted_audio:
+                    normalized.append(
+                        {
+                            "name": name,
+                            "kind": "audio",
+                            "mime": mime,
+                            "size": int(raw.get("size") or stored_file.stat().st_size),
+                            "data_url": "",
+                            "stored_path": stored_path,
+                            "preview_url": str(raw.get("preview_url") or f"/api/audio/content?id={urllib.parse.quote(str(raw.get('audio_job_id') or ''))}"),
+                            "preview_kind": "audio",
+                            "width": 0,
+                            "height": 0,
+                            "page_count": 0,
+                            "duration_seconds": float(raw.get("duration_seconds") or 0),
+                            "text_excerpt": str(raw.get("text_excerpt") or "")[:6000],
+                            "analysis_note": str(raw.get("analysis_note") or "Audio retained for LocalSTT transcription."),
+                            "analysis_source": str(raw.get("analysis_source") or "localstt:large-v3"),
+                            "analysis_status": str(raw.get("analysis_status") or ("succeeded" if analyze else "queued")),
+                            "analysis_markdown": str(raw.get("analysis_markdown") or ""),
+                            "mirror_markdown_path": str(raw.get("mirror_markdown_path") or ""),
+                            "audio_job_id": str(raw.get("audio_job_id") or ""),
+                            "language": str(raw.get("language") or ""),
+                            "diarization_status": str(raw.get("diarization_status") or ""),
+                            "summary": str(raw.get("summary") or ""),
+                        }
+                    )
+                    continue
             if (not data_url.startswith("data:") or "," not in data_url) and stored_file and stored_file.exists() and ROOT_DIR in stored_file.parents:
                 data_url = bytes_to_data_url(stored_file.read_bytes(), str(raw.get("mime") or "application/octet-stream"))
             if not data_url.startswith("data:") or "," not in data_url:
@@ -1836,9 +2290,6 @@ Rules:
                 size = int(raw.get("size", 0))
             except Exception:
                 size = 0
-            mime = str(raw.get("mime", raw.get("mime_type", "application/octet-stream"))).strip() or "application/octet-stream"
-            name = str(raw.get("name", "attachment")).strip() or "attachment"
-            kind = str(raw.get("kind", "")).strip().lower()
             if not kind:
                 if mime.startswith("image/"):
                     kind = "image"
@@ -1846,7 +2297,7 @@ Rules:
                     kind = "video"
                 else:
                     kind = "file"
-            if kind not in {"image", "video", "file"}:
+            if kind not in {"image", "video", "file", "audio"}:
                 kind = "file"
             detected_mime, blob = data_url_to_bytes(data_url)
             if detected_mime:
@@ -2102,11 +2553,13 @@ Rules:
     def process_chat_queue_item(self, item: dict[str, Any]) -> None:
         try:
             user_path = ROOT_DIR / str(item.get("user_message_path") or "")
-            if user_path.exists():
+            if user_path.exists() and not bool(item.get("attachments_preanalyzed")):
                 self.update_message_queue_status(user_path, "running")
                 self.update_chat_queue_item(item, {"attachment_analysis_status": "running"})
                 self.analyze_message_attachments(user_path, str(item["session_id"]), str(item["id"]))
                 item = self.read_chat_queue_item(self.chat_queue_path(str(item["session_id"]), str(item["id"])))
+            elif user_path.exists():
+                self.update_message_queue_status(user_path, "running")
             result = self.reply_to_stored_message(
                 str(item["message"]),
                 str(item["session_id"]),
@@ -2270,6 +2723,10 @@ Rules:
                     "duration_seconds": float(row.get("duration_seconds", 0) or 0),
                     "width": int(row.get("width", 0)) if str(row.get("width", 0)).isdigit() else 0,
                     "height": int(row.get("height", 0)) if str(row.get("height", 0)).isdigit() else 0,
+                    "audio_job_id": str(row.get("audio_job_id", "")),
+                    "language": str(row.get("language", "")),
+                    "diarization_status": str(row.get("diarization_status", "")),
+                    "summary": str(row.get("summary", "")),
                 }
             )
         row = {
@@ -5467,6 +5924,7 @@ INDEX_HTML = r"""<!doctype html>
     .msg-attachment { border-radius: 14px; padding: 8px; background: rgba(255, 255, 255, 0.2); border: 1px solid rgba(39, 55, 46, 0.14); overflow: hidden; }
     .msg-attachment img,
     .msg-attachment video { display: block; max-width: 100%; width: auto; max-height: min(42vh, 320px); margin: 0 auto; border-radius: 10px; object-fit: contain; }
+    .msg-attachment audio { display: block; width: min(100%, 520px); min-width: 240px; margin: 2px 0; }
     .msg-attachment iframe { display: block; width: 100%; min-height: 180px; max-height: min(42vh, 320px); border: 0; border-radius: 10px; background: rgba(255, 255, 255, 0.72); }
     .msg-attachment-meta { margin-top: 6px; color: var(--muted); font-size: 11px; }
     .msg-attachment-preview { color: inherit; border-radius: 8px; padding: 8px; background: rgba(255, 255, 255, 0.18); border: 1px dashed rgba(39, 55, 46, 0.24); }
@@ -5487,6 +5945,16 @@ INDEX_HTML = r"""<!doctype html>
     .attach-btn:hover { transform: none; }
     .attach-btn svg { width: 20px; height: 20px; pointer-events: none; }
     .mic-btn.listening { background: var(--coral); color: white; animation: mic-pulse 1.35s ease-in-out infinite; }
+    .audio-message-btn.recording { background: #b42318; color: white; animation: mic-pulse 1.1s ease-in-out infinite; }
+    .voice-language-menu[hidden] { display: none; }
+    .voice-language-menu { position: fixed; inset: 0; z-index: 120; display: flex; align-items: flex-end; justify-content: center; padding: 18px; background: rgba(16, 25, 21, 0.38); backdrop-filter: blur(4px); }
+    .voice-language-sheet { width: min(520px, 100%); max-height: min(70vh, 620px); overflow-y: auto; border: 1px solid rgba(39, 55, 46, 0.16); border-radius: 20px; padding: 14px; background: #fbfefc; box-shadow: 0 22px 72px rgba(20, 34, 27, 0.26); }
+    .voice-language-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+    .voice-language-head strong { font-size: 15px; }
+    .voice-language-close { width: 32px; height: 32px; min-width: 32px; padding: 0; background: rgba(29, 37, 32, 0.08); color: var(--ink); }
+    .voice-language-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .voice-language-option { min-width: 0; padding: 10px 12px; border-radius: 12px; background: rgba(29, 37, 32, 0.06); color: var(--ink); text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .voice-language-option.selected { background: var(--teal); color: white; }
     .composer-sync-status { margin-left: auto; min-width: 0; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .composer-sync-status.saving { color: #8a5c00; }
     .composer-sync-status.saved { color: var(--teal-dark); }
@@ -5681,6 +6149,9 @@ INDEX_HTML = r"""<!doctype html>
       textarea { min-height: 72px; max-height: 32vh; border-radius: 16px; padding: 10px 11px; }
       .attach-row { flex-wrap: nowrap; min-width: 0; }
       .attach-btn { width: 42px; height: 42px; min-width: 42px; }
+      .msg-attachment audio { width: 100%; min-width: 0; }
+      .voice-language-menu { padding: 10px max(10px, env(safe-area-inset-right)) max(10px, env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left)); }
+      .voice-language-sheet { border-radius: 18px; }
       .attach-hint { display: none; }
       .composer-sync-status { margin-left: 0; flex: 1 1 auto; text-align: right; }
       .composer .row { position: relative; flex-wrap: nowrap; gap: 6px; margin-top: 8px; padding-bottom: 16px; align-items: center; }
@@ -5787,8 +6258,19 @@ INDEX_HTML = r"""<!doctype html>
               <path d="M12 19v3"></path>
             </svg>
           </button>
+          <button id="audioMessageButton" class="secondary attach-btn audio-message-btn" type="button" aria-label="Record high-quality audio message" title="Record high-quality audio message">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M4 12v2"></path><path d="M8 8v8"></path><path d="M12 5v14"></path><path d="M16 8v8"></path><path d="M20 11v3"></path>
+            </svg>
+          </button>
           <span id="attachmentHint" class="sub attach-hint">Attach files, images, or video</span>
           <span id="composerStatus" class="composer-sync-status" role="status" aria-live="polite">Saved locally</span>
+        </div>
+        <div id="voiceLanguageMenu" class="voice-language-menu" hidden>
+          <div class="voice-language-sheet" role="dialog" aria-modal="true" aria-labelledby="voiceLanguageTitle">
+            <div class="voice-language-head"><strong id="voiceLanguageTitle">Dictation language</strong><button id="voiceLanguageClose" class="voice-language-close" type="button" aria-label="Close language menu">×</button></div>
+            <div id="voiceLanguageOptions" class="voice-language-options"></div>
+          </div>
         </div>
         <div id="attachmentPills" class="attachment-pills" hidden></div>
         <div id="attachmentPreviewArea" class="attachment-preview-area" hidden></div>
@@ -6053,7 +6535,16 @@ INDEX_HTML = r"""<!doctype html>
       speechActive: false,
       speechKeepAlive: false,
       speechBaseText: "",
-      speechFinalText: ""
+      speechFinalText: "",
+      speechLanguage: "",
+      speechLongPressTimer: null,
+      speechLongPressTriggered: false,
+      audioRecorder: null,
+      audioStream: null,
+      audioChunks: [],
+      audioRecordingStartedAt: 0,
+      audioRecordingTimer: null,
+      audioUploadRunning: false
     };
     const $ = (id) => document.getElementById(id);
     const shell = $("shell");
@@ -6361,7 +6852,11 @@ INDEX_HTML = r"""<!doctype html>
           text_excerpt: attachment.text_excerpt,
           preview_kind: attachment.preview_kind,
           width: attachment.width,
-          height: attachment.height
+          height: attachment.height,
+          audio_job_id: attachment.audio_job_id,
+          language: attachment.language,
+          diarization_status: attachment.diarization_status,
+          duration_seconds: attachment.duration_seconds
         }))
       })));
     }
@@ -7025,6 +7520,7 @@ INDEX_HTML = r"""<!doctype html>
       const safeName = (name || "").toLowerCase();
       if (safeMime.startsWith("image/") || /\.(png|jpe?g|gif|webp|bmp|svg|avif|heic)$/i.test(safeName)) return "image";
       if (safeMime.startsWith("video/") || /\.(mp4|mov|m4v|webm|avi|mkv|flv)$/i.test(safeName)) return "video";
+      if (safeMime.startsWith("audio/") || /\.(aac|flac|m4a|mp3|ogg|opus|wav)$/i.test(safeName)) return "audio";
       return "file";
     }
 
@@ -7134,6 +7630,251 @@ INDEX_HTML = r"""<!doctype html>
       $("attachmentInput").value = "";
     }
 
+    const SPEECH_LANGUAGES = [
+      { value: "", label: "System / Auto" },
+      { value: "zh-CN", label: "普通话" },
+      { value: "zh-TW", label: "繁體中文" },
+      { value: "yue-Hant-HK", label: "廣東話" },
+      { value: "en-US", label: "English (US)" },
+      { value: "en-GB", label: "English (UK)" },
+      { value: "ja-JP", label: "日本語" },
+      { value: "ko-KR", label: "한국어" },
+      { value: "vi-VN", label: "Tiếng Việt" },
+      { value: "fr-FR", label: "Français" },
+      { value: "es-ES", label: "Español" },
+      { value: "de-DE", label: "Deutsch" },
+      { value: "ar", label: "العربية" },
+      { value: "ru-RU", label: "Русский" }
+    ];
+
+    function loadSpeechLanguage() {
+      try {
+        state.speechLanguage = localStorage.getItem("lazyblog.studio.speechLanguage") || "";
+      } catch {
+        state.speechLanguage = "";
+      }
+      if (!SPEECH_LANGUAGES.some((row) => row.value === state.speechLanguage)) state.speechLanguage = "";
+    }
+
+    function speechLanguageLabel() {
+      const selected = SPEECH_LANGUAGES.find((row) => row.value === state.speechLanguage);
+      return selected ? selected.label : "System / Auto";
+    }
+
+    function applySpeechLanguage() {
+      if (state.speechRecognition) state.speechRecognition.lang = state.speechLanguage || navigator.language || "en-US";
+      const label = speechLanguageLabel();
+      $("micButton").title = `Native dictation · ${label} · long-press to change`;
+      $("micButton").setAttribute("aria-label", `Start native dictation in ${label}; long-press to change language`);
+    }
+
+    function renderSpeechLanguages() {
+      const root = $("voiceLanguageOptions");
+      root.innerHTML = "";
+      for (const language of SPEECH_LANGUAGES) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = `voice-language-option${language.value === state.speechLanguage ? " selected" : ""}`;
+        button.textContent = language.label;
+        button.addEventListener("click", () => {
+          state.speechLanguage = language.value;
+          try { localStorage.setItem("lazyblog.studio.speechLanguage", language.value); } catch {}
+          applySpeechLanguage();
+          closeSpeechLanguageMenu();
+          setComposerStatus(`Native dictation: ${language.label}`, "saved");
+        });
+        root.appendChild(button);
+      }
+    }
+
+    function openSpeechLanguageMenu() {
+      stopSpeechRecognition();
+      renderSpeechLanguages();
+      $("voiceLanguageMenu").hidden = false;
+    }
+
+    function closeSpeechLanguageMenu() {
+      $("voiceLanguageMenu").hidden = true;
+    }
+
+    function audioMessageDatabase() {
+      return new Promise((resolve, reject) => {
+        const request = indexedDB.open("lazyblog-studio-audio", 1);
+        request.onupgradeneeded = () => {
+          const db = request.result;
+          if (!db.objectStoreNames.contains("pending")) db.createObjectStore("pending", { keyPath: "id" });
+        };
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error || new Error("Could not open audio storage"));
+      });
+    }
+
+    async function audioStoreRequest(mode, callback) {
+      const db = await audioMessageDatabase();
+      return new Promise((resolve, reject) => {
+        const transaction = db.transaction("pending", mode);
+        const store = transaction.objectStore("pending");
+        const request = callback(store);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error || new Error("Audio storage failed"));
+        transaction.oncomplete = () => db.close();
+        transaction.onerror = () => reject(transaction.error || new Error("Audio transaction failed"));
+      });
+    }
+
+    function savePendingAudio(record) {
+      return audioStoreRequest("readwrite", (store) => store.put(record));
+    }
+
+    function deletePendingAudio(id) {
+      return audioStoreRequest("readwrite", (store) => store.delete(id));
+    }
+
+    function listPendingAudio() {
+      return audioStoreRequest("readonly", (store) => store.getAll());
+    }
+
+    function preferredAudioMime() {
+      if (!("MediaRecorder" in window)) return "";
+      return ["audio/webm;codecs=opus", "audio/mp4", "audio/webm", "audio/ogg;codecs=opus"]
+        .find((value) => !MediaRecorder.isTypeSupported || MediaRecorder.isTypeSupported(value)) || "";
+    }
+
+    function audioFilename(mime) {
+      if (String(mime).includes("mp4")) return "voice-message.m4a";
+      if (String(mime).includes("ogg")) return "voice-message.ogg";
+      return "voice-message.webm";
+    }
+
+    function setAudioRecordingState(active, label = "") {
+      const button = $("audioMessageButton");
+      button.classList.toggle("recording", active);
+      button.setAttribute("aria-pressed", String(active));
+      button.setAttribute("aria-label", active ? "Stop and send audio message" : "Record high-quality audio message");
+      button.title = active ? "Stop and send audio message" : "Record high-quality audio message with Whisper large-v3";
+      if (label) setComposerStatus(label, active ? "saving" : "saved");
+    }
+
+    function clearAudioRecordingTimer() {
+      if (state.audioRecordingTimer) clearInterval(state.audioRecordingTimer);
+      state.audioRecordingTimer = null;
+    }
+
+    async function startAudioMessageRecording() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !("MediaRecorder" in window)) {
+        setComposerStatus("Audio messages are not supported by this browser", "error");
+        return;
+      }
+      stopSpeechRecognition();
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+        });
+        const mimeType = preferredAudioMime();
+        const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+        state.audioRecorder = recorder;
+        state.audioStream = stream;
+        state.audioChunks = [];
+        state.audioRecordingStartedAt = Date.now();
+        recorder.ondataavailable = (event) => {
+          if (event.data && event.data.size) state.audioChunks.push(event.data);
+        };
+        recorder.onerror = (event) => {
+          setComposerStatus(event.error && event.error.message ? event.error.message : "Audio recording failed", "error");
+        };
+        recorder.onstop = async () => {
+          clearAudioRecordingTimer();
+          const actualType = recorder.mimeType || mimeType || "audio/webm";
+          const blob = new Blob(state.audioChunks, { type: actualType });
+          state.audioChunks = [];
+          if (state.audioStream) state.audioStream.getTracks().forEach((track) => track.stop());
+          state.audioStream = null;
+          state.audioRecorder = null;
+          setAudioRecordingState(false, "Saving audio message...");
+          if (!blob.size) {
+            setComposerStatus("No audio was recorded", "error");
+            return;
+          }
+          const id = `audio-${Date.now()}-${globalThis.crypto && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(16).slice(2)}`;
+          const record = {
+            id,
+            blob,
+            mime: actualType,
+            filename: audioFilename(actualType),
+            session_id: state.sessionId || "",
+            created_at: new Date().toISOString()
+          };
+          try {
+            await savePendingAudio(record);
+            setComposerStatus(navigator.onLine ? "Audio saved; uploading..." : "Audio saved offline; it will send when connected", navigator.onLine ? "saving" : "saved");
+            uploadPendingAudioMessages().catch(() => {});
+          } catch (error) {
+            setComposerStatus(error.message || "Could not preserve the audio message", "error");
+          }
+        };
+        recorder.start(1000);
+        setAudioRecordingState(true, "Recording audio · tap waveform to send");
+        state.audioRecordingTimer = setInterval(() => {
+          const elapsed = Math.floor((Date.now() - state.audioRecordingStartedAt) / 1000);
+          const minutes = String(Math.floor(elapsed / 60)).padStart(2, "0");
+          const seconds = String(elapsed % 60).padStart(2, "0");
+          setComposerStatus(`Recording audio ${minutes}:${seconds} · tap waveform to send`, "saving");
+        }, 1000);
+      } catch (error) {
+        setAudioRecordingState(false);
+        setComposerStatus(error && error.name === "NotAllowedError" ? "Microphone permission was not granted" : (error.message || "Could not start audio recording"), "error");
+      }
+    }
+
+    function stopAudioMessageRecording() {
+      if (state.audioRecorder && state.audioRecorder.state !== "inactive") state.audioRecorder.stop();
+    }
+
+    function toggleAudioMessageRecording() {
+      if (state.audioRecorder && state.audioRecorder.state !== "inactive") stopAudioMessageRecording();
+      else startAudioMessageRecording();
+    }
+
+    async function uploadPendingAudioMessages() {
+      if (state.audioUploadRunning || !navigator.onLine) return;
+      state.audioUploadRunning = true;
+      try {
+        const records = (await listPendingAudio()).sort((left, right) => String(left.created_at).localeCompare(String(right.created_at)));
+        for (const record of records) {
+          setComposerStatus("Uploading saved audio message...", "saving");
+          try {
+            const response = await fetch("/api/audio/jobs", {
+              method: "POST",
+              credentials: "same-origin",
+              headers: {
+                "Content-Type": record.mime || "audio/webm",
+                "X-Filename": record.filename || "voice-message.webm",
+                "X-Session-ID": record.session_id || state.sessionId || "",
+                "X-Language": "auto",
+                "X-Diarize": "auto",
+                "X-Idempotency-Key": record.id
+              },
+              body: record.blob
+            });
+            const data = await response.json().catch(() => ({}));
+            if (response.status === 401) {
+              window.location.assign("/login");
+              return;
+            }
+            if (!response.ok || data.ok === false) throw new Error(data.error || `Audio upload failed (${response.status})`);
+            await deletePendingAudio(record.id);
+            if (data.session) renderSession(data);
+            setComposerStatus("Audio sent · transcribing with large-v3", "saving");
+          } catch (error) {
+            setComposerStatus(`${error.message || "Audio upload failed"}; saved for retry`, "error");
+            break;
+          }
+        }
+      } finally {
+        state.audioUploadRunning = false;
+      }
+    }
+
     function setSpeechState(active, message = "") {
       state.speechActive = active;
       const button = $("micButton");
@@ -7189,7 +7930,7 @@ INDEX_HTML = r"""<!doctype html>
         return;
       }
       const recognition = new SpeechRecognition();
-      recognition.lang = navigator.language || "en-US";
+      recognition.lang = state.speechLanguage || navigator.language || "en-US";
       recognition.continuous = true;
       recognition.interimResults = true;
       recognition.maxAlternatives = 1;
@@ -7232,6 +7973,7 @@ INDEX_HTML = r"""<!doctype html>
       };
       state.speechRecognition = recognition;
       button.disabled = false;
+      applySpeechLanguage();
     }
 
     function toggleSpeechRecognition() {
@@ -7245,7 +7987,13 @@ INDEX_HTML = r"""<!doctype html>
     function buildMessageAttachmentNode(attachment) {
       const item = document.createElement("div");
       item.className = "msg-attachment";
-      if (attachment.kind === "image") {
+      if (attachment.kind === "audio") {
+        const audio = document.createElement("audio");
+        audio.controls = true;
+        audio.preload = "metadata";
+        audio.src = attachment.preview_url || attachment.data_url || "";
+        item.appendChild(audio);
+      } else if (attachment.kind === "image") {
         const button = document.createElement("button");
         button.type = "button";
         button.className = "attachment-open";
@@ -7946,7 +8694,37 @@ INDEX_HTML = r"""<!doctype html>
       if (state.busy) return;
       $("attachmentInput").click();
     });
-    $("micButton").addEventListener("click", toggleSpeechRecognition);
+    $("micButton").addEventListener("pointerdown", () => {
+      state.speechLongPressTriggered = false;
+      if (state.speechLongPressTimer) clearTimeout(state.speechLongPressTimer);
+      state.speechLongPressTimer = setTimeout(() => {
+        state.speechLongPressTriggered = true;
+        openSpeechLanguageMenu();
+      }, 550);
+    });
+    for (const eventName of ["pointerup", "pointercancel", "pointerleave"]) {
+      $("micButton").addEventListener(eventName, () => {
+        if (state.speechLongPressTimer) clearTimeout(state.speechLongPressTimer);
+        state.speechLongPressTimer = null;
+      });
+    }
+    $("micButton").addEventListener("click", (event) => {
+      if (state.speechLongPressTriggered) {
+        state.speechLongPressTriggered = false;
+        event.preventDefault();
+        return;
+      }
+      toggleSpeechRecognition();
+    });
+    $("micButton").addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      openSpeechLanguageMenu();
+    });
+    $("audioMessageButton").addEventListener("click", toggleAudioMessageRecording);
+    $("voiceLanguageClose").addEventListener("click", closeSpeechLanguageMenu);
+    $("voiceLanguageMenu").addEventListener("click", (event) => {
+      if (event.target === $("voiceLanguageMenu")) closeSpeechLanguageMenu();
+    });
     $("quotePreviousButton").addEventListener("click", quotePreviousMessage);
     $("composerReplyClear").addEventListener("click", clearReplyTarget);
     $("attachmentInput").addEventListener("change", onAttachmentsSelected);
@@ -8089,6 +8867,7 @@ INDEX_HTML = r"""<!doctype html>
         navigator.serviceWorker.register("/service-worker.js").catch(() => {});
       });
     }
+    loadSpeechLanguage();
     initSpeechRecognition();
     loadComposerDraft().catch(() => {});
     loadSettings().catch((err) => { $("settingsLog").textContent = err.message; });
@@ -8097,10 +8876,12 @@ INDEX_HTML = r"""<!doctype html>
     loadCategories(false).catch(() => {});
     loadJobs().catch(() => {});
     startEventStream();
+    uploadPendingAudioMessages().catch(() => {});
     scheduleSafetySync(90000);
     window.addEventListener("online", () => {
       startEventStream(true);
       if (state.composerDirty) scheduleComposerSave(80);
+      uploadPendingAudioMessages().catch(() => {});
       runSafetySync().catch(() => {});
     });
     window.addEventListener("pagehide", () => {
@@ -8253,7 +9034,7 @@ PWA_MANIFEST = {
 }
 
 
-SERVICE_WORKER = r"""const CACHE_NAME = "lazyblog-studio-v6";
+SERVICE_WORKER = r"""const CACHE_NAME = "lazyblog-studio-v7";
 const APP_SHELL = [
   "/manifest.webmanifest",
   "/icons/lazyblog.svg",
@@ -8413,6 +9194,55 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def send_file(self, path: Path, content_type: str, *, filename: str = "") -> None:
+            size = path.stat().st_size
+            start = 0
+            end = max(0, size - 1)
+            response_status = HTTPStatus.OK
+            range_header = self.headers.get("Range", "").strip()
+            if range_header:
+                match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header)
+                if not match:
+                    self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE.value)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                raw_start, raw_end = match.groups()
+                if raw_start:
+                    start = int(raw_start)
+                    end = min(int(raw_end), end) if raw_end else end
+                elif raw_end:
+                    length = min(int(raw_end), size)
+                    start = size - length
+                if start > end or start >= size:
+                    self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE.value)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                response_status = HTTPStatus.PARTIAL_CONTENT
+            length = max(0, end - start + 1)
+            self.send_response(response_status.value)
+            self.send_header("Content-Type", content_type or "application/octet-stream")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Cache-Control", "private, max-age=3600")
+            if filename:
+                self.send_header("Content-Disposition", f"inline; filename*=UTF-8''{urllib.parse.quote(filename)}")
+            if response_status == HTTPStatus.PARTIAL_CONTENT:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.send_header("Content-Length", str(length))
+            self.end_headers()
+            with path.open("rb") as handle:
+                handle.seek(start)
+                remaining = length
+                while remaining:
+                    chunk = handle.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
 
         def read_body(self) -> dict[str, Any]:
             length = int(self.headers.get("Content-Length", "0") or "0")
@@ -8576,6 +9406,19 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
                     session_id = params.get("session_id", [""])[0]
                     self.send_json({"composer": app.composer_payload(session_id)})
                     return
+                if parsed.path == "/api/audio/job":
+                    params = urllib.parse.parse_qs(parsed.query)
+                    _path, job = app.find_audio_job(params.get("id", [""])[0])
+                    self.send_json({"audio_job": app.public_audio_job(job)})
+                    return
+                if parsed.path == "/api/audio/content":
+                    params = urllib.parse.parse_qs(parsed.query)
+                    _path, job = app.find_audio_job(params.get("id", [""])[0])
+                    audio_path = (ROOT_DIR / str(job.get("stored_path") or "")).resolve()
+                    if not audio_path.is_file() or UPLOAD_ROOT.resolve() not in audio_path.parents:
+                        raise WebAppError("retained audio is unavailable")
+                    self.send_file(audio_path, str(job.get("content_type") or "application/octet-stream"), filename=str(job.get("filename") or audio_path.name))
+                    return
                 if parsed.path == "/api/messages":
                     params = urllib.parse.parse_qs(parsed.query)
                     session_id = params.get("session_id", [""])[0]
@@ -8649,6 +9492,11 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:  # noqa: N802
             parsed = urllib.parse.urlparse(self.path)
             try:
+                if parsed.path == "/api/audio/jobs":
+                    if not self.authorize_request(parsed.path):
+                        return
+                    self.send_json(app.accept_audio_message(self.rfile, self.headers), HTTPStatus.ACCEPTED)
+                    return
                 payload = self.read_body()
                 if parsed.path == "/api/login":
                     username = str(payload.get("username", "")).strip()
@@ -8723,6 +9571,9 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
                             attachments=payload.get("attachments"),
                         )
                     )
+                    return
+                if parsed.path == "/api/audio/retry":
+                    self.send_json(app.retry_audio_job(str(payload.get("id") or payload.get("job_id") or "")))
                     return
                 if parsed.path == "/api/categories/sync":
                     self.send_json(app.sync_category_mirror())

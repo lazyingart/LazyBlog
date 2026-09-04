@@ -85,8 +85,14 @@ def split_front_matter(text: str) -> tuple[dict[str, str], str]:
             continue
         key, value = line.split(":", 1)
         value = value.strip()
-        if (value.startswith("'") and value.endswith("'")) or (value.startswith('"') and value.endswith('"')):
+        if value.startswith("'") and value.endswith("'"):
             value = value[1:-1]
+        elif value.startswith('"') and value.endswith('"'):
+            try:
+                decoded = json.loads(value)
+                value = decoded if isinstance(decoded, str) else str(decoded)
+            except json.JSONDecodeError:
+                value = value[1:-1]
         front_matter[key.strip()] = value.replace("''", "'")
 
     return front_matter, parts[1].lstrip("\n")
