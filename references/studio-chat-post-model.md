@@ -95,6 +95,11 @@ Legacy `/api/draft` and `/api/publish` still exist for compatibility, but the St
 - `web-action-router.txt` uses `gpt-5.6-sol` with medium reasoning only for likely control instructions. It classifies chat messages into one bounded action; `gpt-5.3-codex-spark` remains a configured fallback.
 - `web-git-commit-push.txt` also uses `gpt-5.3-codex-spark` medium through `codex exec`. The backend generates an allowlisted shell script with exact paths, then Codex runs only that script. This keeps commit/push deterministic while still using the Codex prompt tool.
 
+Fast chat and controlled work have separate durable workers. Items stay ordered
+inside each lane, a long draft does not block an independent note reply, and
+only the controlled worker executes WordPress mutations. Interrupted running
+items return to the queue after restart.
+
 Studio invokes prompt wrappers with `codex exec --ephemeral` and supplies the
 stored transcript and managed object state explicitly. It does not rely on a
 resumed hidden Codex thread as application memory. This keeps account fallback,

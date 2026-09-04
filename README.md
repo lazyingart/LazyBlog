@@ -140,12 +140,13 @@ supports efficient queries, while an append-only event table preserves edits,
 processing transitions, and deleted-message snapshots. Startup reconciliation
 backfills Markdown records without duplicating unchanged events.
 
-Prompt profiles use two main lanes. Fast chat defaults to `gpt-5.6-sol / low`;
+Prompt profiles use two concurrent lanes. Fast chat defaults to `gpt-5.6-sol / low`;
 drafting, revision, research, and publish preparation default to
-`gpt-5.6-sol / high`. Routing and other structured responses use medium
-reasoning. An optional AgentShell route can try several local account profiles
-in order, retry with `gpt-5.3-codex-spark`, and finally use AgInTi with DeepSeek
-when that hosted fallback is explicitly enabled:
+`gpt-5.6-sol / high`. A long controlled task cannot block queued note replies.
+Routing and other structured responses use medium reasoning. An optional
+AgentShell route can try several local account profiles in order, retry with
+`gpt-5.3-codex-spark`, and finally use AgInTi with DeepSeek when that hosted
+fallback is explicitly enabled:
 
 ```text
 LAZYBLOG_CODEX_ACCOUNTS=personal,company,lab

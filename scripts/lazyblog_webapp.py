@@ -76,6 +76,7 @@ DEFAULT_ACTION_REASONING = "low"
 DEFAULT_GIT_MODEL = "gpt-5.3-codex-spark"
 DEFAULT_GIT_REASONING = "medium"
 DEFAULT_MESSAGE_BATCH_SIZE = 10
+CHAT_QUEUE_LANES = ("fast-chat", "controlled-task")
 MAX_COMPOSER_TEXT_CHARS = 250_000
 MAX_AUDIO_MESSAGE_BYTES = 100 * 1024 * 1024
 MAX_ARTIFACT_TEXT_BYTES = 520_000
@@ -700,7 +701,7 @@ class LazyBlogStudio:
         self.artifact_lock = threading.Lock()
         self.chat_queue_lock = threading.Lock()
         self.composer_lock = threading.Lock()
-        self.message_lock = threading.Lock()
+        self.message_lock = threading.RLock()
         self.message_store_lock = threading.RLock()
         self.audio_job_lock = threading.Lock()
         self.chat_queue_event = threading.Event()
@@ -711,8 +712,17 @@ class LazyBlogStudio:
         self.initialize_message_store()
         self.reset_stale_chat_queue_items()
         self.reset_stale_audio_jobs()
-        self.chat_queue_thread = threading.Thread(target=self.chat_queue_loop, daemon=True)
-        self.chat_queue_thread.start()
+        self.chat_queue_threads = [
+            threading.Thread(
+                target=self.chat_queue_loop,
+                args=(lane,),
+                name=f"lazyblog-{lane}",
+                daemon=True,
+            )
+            for lane in CHAT_QUEUE_LANES
+        ]
+        for thread in self.chat_queue_threads:
+            thread.start()
         self.audio_job_thread = threading.Thread(target=self.audio_job_loop, daemon=True)
         self.audio_job_thread.start()
 
@@ -1711,32 +1721,35 @@ Rules:
         return {"deleted": safe_id, "trash_path": str(target.relative_to(ROOT_DIR)), "sessions": self.list_sessions()}
 
     def append_message(self, session_id: str, role: str, content: str, extra: dict[str, Any] | None = None) -> Path:
-        meta = self.load_session(session_id)
-        msg_id = f"{stamp()}-{uuid.uuid4().hex[:6]}-{role}"
-        path = self.session_dir(session_id) / "messages" / f"{msg_id}.md"
-        front_matter = {
-            "kind": "lazyblog-chat-message",
-            "session_id": session_id,
-            "role": role,
-            "created_at": now_iso(),
-        }
-        if extra:
-            front_matter.update(extra)
-        self.write_message_record(path, front_matter, content, "created")
-        meta["message_count"] = int(meta.get("message_count", 0)) + 1
-        if role == "user" and meta.get("title") in {"Untitled chat", ""}:
-            title_candidate = content.strip().splitlines()[0][:80] if content.strip() else ""
-            if not title_candidate and isinstance(extra, dict):
-                try:
-                    parsed = json.loads(str(extra.get("attachments_json") or "[]"))
-                except json.JSONDecodeError:
-                    parsed = []
-                if isinstance(parsed, list) and parsed:
-                    first_name = str((parsed[0] or {}).get("name") or "").strip()
-                    title_candidate = first_name[:80]
-            meta["title"] = title_candidate or "Untitled chat"
-        self.save_session(session_id, meta)
-        return path
+        if not hasattr(self, "message_lock"):
+            self.message_lock = threading.RLock()
+        with self.message_lock:
+            meta = self.load_session(session_id)
+            msg_id = f"{stamp()}-{uuid.uuid4().hex[:6]}-{role}"
+            path = self.session_dir(session_id) / "messages" / f"{msg_id}.md"
+            front_matter = {
+                "kind": "lazyblog-chat-message",
+                "session_id": session_id,
+                "role": role,
+                "created_at": now_iso(),
+            }
+            if extra:
+                front_matter.update(extra)
+            self.write_message_record(path, front_matter, content, "created")
+            meta["message_count"] = int(meta.get("message_count", 0)) + 1
+            if role == "user" and meta.get("title") in {"Untitled chat", ""}:
+                title_candidate = content.strip().splitlines()[0][:80] if content.strip() else ""
+                if not title_candidate and isinstance(extra, dict):
+                    try:
+                        parsed = json.loads(str(extra.get("attachments_json") or "[]"))
+                    except json.JSONDecodeError:
+                        parsed = []
+                    if isinstance(parsed, list) and parsed:
+                        first_name = str((parsed[0] or {}).get("name") or "").strip()
+                        title_candidate = first_name[:80]
+                meta["title"] = title_candidate or "Untitled chat"
+            self.save_session(session_id, meta)
+            return path
 
     def attachment_storage_dir(self, session_id: str, queue_id: str) -> Path:
         return UPLOAD_ROOT / safe_session_id(session_id) / safe_job_id(queue_id or "manual")
@@ -2107,6 +2120,7 @@ Rules:
             "started_at": None,
             "finished_at": None,
             "message": message_text,
+            "lane": self.chat_lane_for_message(message_text),
             "user_message_path": str(message_path.relative_to(ROOT_DIR)),
             "assistant_message_path": "",
             "attachment_analysis_status": "succeeded",
@@ -2679,6 +2693,8 @@ Rules:
             "active_count": len(active),
             "queued_count": sum(1 for item in active if item.get("status") == "queued"),
             "running_count": sum(1 for item in active if item.get("status") == "running"),
+            "fast_count": sum(1 for item in active if self.chat_queue_lane(item) == "fast-chat"),
+            "controlled_count": sum(1 for item in active if self.chat_queue_lane(item) == "controlled-task"),
             "items": active[-10:],
         }
 
@@ -2712,6 +2728,7 @@ Rules:
             "started_at": None,
             "finished_at": None,
             "message": message,
+            "lane": self.chat_lane_for_message(message),
             "user_message_path": str(user_path.relative_to(ROOT_DIR)),
             "assistant_message_path": "",
             "attachment_analysis_status": "queued" if clean_attachments else "none",
@@ -2724,10 +2741,21 @@ Rules:
         payload["queued_chat"] = item
         return payload
 
-    def chat_queue_loop(self) -> None:
+    def chat_lane_for_message(self, message: str) -> str:
+        if self.is_control_action_request(message) or self.extract_post_reference_from_message(message):
+            return "controlled-task"
+        return "fast-chat"
+
+    def chat_queue_lane(self, item: dict[str, Any]) -> str:
+        lane = str(item.get("lane") or "")
+        if lane in CHAT_QUEUE_LANES:
+            return lane
+        return self.chat_lane_for_message(str(item.get("message") or ""))
+
+    def chat_queue_loop(self, lane: str = "fast-chat") -> None:
         while True:
             try:
-                item = self.next_chat_queue_item()
+                item = self.next_chat_queue_item(lane)
                 if item is None:
                     self.chat_queue_event.wait(timeout=2.0)
                     self.chat_queue_event.clear()
@@ -2737,12 +2765,15 @@ Rules:
                 traceback.print_exc()
                 time.sleep(1.0)
 
-    def next_chat_queue_item(self) -> dict[str, Any] | None:
+    def next_chat_queue_item(self, lane: str = "fast-chat") -> dict[str, Any] | None:
+        if lane not in CHAT_QUEUE_LANES:
+            raise WebAppError(f"unknown chat queue lane: {lane}")
         with self.chat_queue_lock:
             items = self.chat_queue_items(statuses={"queued"})
-            if not items:
+            item = next((candidate for candidate in items if self.chat_queue_lane(candidate) == lane), None)
+            if item is None:
                 return None
-            item = items[0]
+            item["lane"] = lane
             item["status"] = "running"
             item["started_at"] = item.get("started_at") or now_iso()
             item["updated_at"] = now_iso()

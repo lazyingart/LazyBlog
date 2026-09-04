@@ -29,7 +29,9 @@ class MessageStoreTests(unittest.TestCase):
             patcher.start()
         self.chat_root.mkdir(parents=True, exist_ok=True)
         self.app = lazyblog_webapp.LazyBlogStudio.__new__(lazyblog_webapp.LazyBlogStudio)
+        self.app.message_lock = threading.RLock()
         self.app.message_store_lock = threading.RLock()
+        self.app.chat_queue_lock = threading.Lock()
         self.app.event_lock = threading.Condition()
         self.app.event_seq = 0
         self.app.events = deque(maxlen=100)
@@ -112,6 +114,42 @@ class MessageStoreTests(unittest.TestCase):
         deterministic_hint.assert_not_called()
         self.assertEqual(routed["action"], "no_op")
         self.assertEqual(routed["routing_lane"], "fast-chat")
+
+    def test_queue_lane_separates_notes_from_controlled_post_work(self) -> None:
+        self.assertEqual(self.app.chat_lane_for_message("A note about today's work."), "fast-chat")
+        self.assertEqual(self.app.chat_lane_for_message("Draft a new post from today's notes."), "controlled-task")
+        self.assertEqual(
+            self.app.chat_lane_for_message("https://blog.example.test/?p=123"),
+            "controlled-task",
+        )
+        self.assertEqual(
+            self.app.chat_lane_for_message("Do not draft or publish this note."),
+            "fast-chat",
+        )
+
+    def test_each_worker_claims_only_its_queue_lane(self) -> None:
+        session = self.app.create_session()
+        controlled = {
+            "id": "20260904T120000Z-controlled",
+            "session_id": session["id"],
+            "status": "queued",
+            "created_at": "2026-09-04T12:00:00Z",
+            "message": "Draft a new post.",
+            "lane": "controlled-task",
+        }
+        fast = {
+            "id": "20260904T120001Z-fast",
+            "session_id": session["id"],
+            "status": "queued",
+            "created_at": "2026-09-04T12:00:01Z",
+            "message": "Remember this note.",
+            "lane": "fast-chat",
+        }
+        self.app.write_chat_queue_item(controlled)
+        self.app.write_chat_queue_item(fast)
+
+        self.assertEqual(self.app.next_chat_queue_item("fast-chat")["id"], fast["id"])
+        self.assertEqual(self.app.next_chat_queue_item("controlled-task")["id"], controlled["id"])
 
 
 if __name__ == "__main__":
