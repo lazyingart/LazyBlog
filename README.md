@@ -28,7 +28,7 @@ language metadata, and reviewed translations.
 | Sync engine | `scripts/lazyblog_sync.py` | Maintain post source Markdown, media migration, and translations |
 | Translation helper | `scripts/lazyblog_translate.py` | Scaffold and push post translations |
 | Category sync | `scripts/sync_live_categories.py` | Pull WordPress category terms and post assignments into local metadata |
-| Studio API | `scripts/lazyblog_webapp.py` | Local PWA/API for chat-to-draft and on-demand translation jobs |
+| Studio API | `scripts/lazyblog_webapp.py` | Mobile PWA/API for durable chat, chat-to-draft, and on-demand translation jobs |
 | WordPress plugin | `wordpress-plugins/lazyblog-translations/` | Store/render translations and request missing ones asynchronously |
 | Local test site | `docker-compose.yml`, `scripts/setup_local_wordpress.sh` | Run a disposable WordPress test site with the plugin mounted |
 | Schemas | `schemas/` | JSON contracts for prompt-tool output |
@@ -114,10 +114,35 @@ scripts/setup_local_wordpress.sh
 Prepare the local Codex translation API:
 
 ```bash
-scripts/install_lazyblog_translation_api.sh --model gpt-5.4 --reasoning low
+scripts/install_lazyblog_translation_api.sh --model gpt-5.6-sol --reasoning low
 ```
 
 OpenAI and DeepSeek provider modes do not need the local API service.
+
+## LazyBlog Studio
+
+Studio uses a bright mobile layout with browser speech dictation, attachments,
+safe GitHub-flavored Markdown, and KaTeX formula rendering. Unsent composer text
+is backed up immediately in the browser and synchronized to an atomic server
+draft. Server-sent events propagate draft changes to other logged-in devices,
+while version conflicts are preserved instead of silently overwriting text.
+
+Prompt profiles default to `gpt-5.6-sol` with low reasoning. An optional
+AgentShell route can try several local account profiles in order, retry with
+`gpt-5.3-codex-spark`, and finally use AgInTi with DeepSeek when that hosted
+fallback is explicitly enabled:
+
+```text
+LAZYBLOG_CODEX_ACCOUNTS=personal,company,lab
+LAZYBLOG_CODEX_FALLBACK_MODEL=gpt-5.3-codex-spark
+LAZYBLOG_CODEX_FALLBACK_REASONING=low
+LAZYBLOG_AGINTI_DEEPSEEK_FALLBACK=false
+LAZYBLOG_AGINTI_DEEPSEEK_MODEL=deepseek-v4-flash
+```
+
+AgentShell retains account credentials; only profile names enter LazyBlog.
+DeepSeek remains disabled in the example because enabling it sends prompt
+contents to a hosted provider.
 
 ## Multilingual Documentation
 

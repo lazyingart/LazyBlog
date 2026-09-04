@@ -20,7 +20,7 @@ fi
 PYTHON_BIN="${LAZYBLOG_PYTHON:-$HOME/miniconda3/bin/python3}"
 DEFAULT_HOST="${LAZYBLOG_WEBAPP_HOST:-127.0.0.1}"
 DEFAULT_PORT="${LAZYBLOG_WEBAPP_PORT:-8765}"
-DEFAULT_MODEL="${LAZYBLOG_WEBAPP_MODEL:-gpt-5.4}"
+DEFAULT_MODEL="${LAZYBLOG_WEBAPP_MODEL:-gpt-5.6-sol}"
 DEFAULT_REASONING="${LAZYBLOG_WEBAPP_REASONING:-low}"
 CODEX_BIN_DIR="${LAZYBLOG_CODEX_BIN_DIR:-$HOME/.local/codex-cli/node_modules/.bin}"
 NGROK_URL="${LAZYBLOG_NGROK_URL:-}"
@@ -47,7 +47,7 @@ cd "$ROOT_DIR"
 if [ -f "$HOME/.nvm/nvm.sh" ]; then
   source "$HOME/.nvm/nvm.sh"
 fi
-export PATH="$CODEX_BIN_DIR:\$PATH"
+export PATH="$HOME/.local/bin:$CODEX_BIN_DIR:\$PATH"
 set -a
 if [ -f .env ]; then
   source .env

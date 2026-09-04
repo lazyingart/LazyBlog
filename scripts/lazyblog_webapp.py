@@ -46,6 +46,14 @@ TAXONOMY_ROOT = ROOT_DIR / "content" / "taxonomy"
 CATEGORY_SNAPSHOT_PATH = TAXONOMY_ROOT / "categories.json"
 POST_PROJECT_ROOT = ROOT_DIR / "content" / "studio-posts"
 STUDIO_SETTINGS_PATH = ROOT_DIR / "content" / "studio-settings.json"
+VENDOR_ROOT = ROOT_DIR / "web" / "vendor"
+VENDOR_ASSETS = {
+    "/assets/vendor/marked.js": ("marked-15.0.12.min.js", "application/javascript; charset=utf-8"),
+    "/assets/vendor/dompurify.js": ("dompurify-3.2.6.min.js", "application/javascript; charset=utf-8"),
+    "/assets/vendor/katex.js": ("katex-0.16.22.min.js", "application/javascript; charset=utf-8"),
+    "/assets/vendor/katex-auto-render.js": ("katex-auto-render-0.16.22.min.js", "application/javascript; charset=utf-8"),
+    "/assets/vendor/katex.css": ("katex-0.16.22.min.css", "text/css; charset=utf-8"),
+}
 CHAT_REPLY_PROMPT = ROOT_DIR / "prompts" / "web-chat-reply.txt"
 CHAT_TASK_PROMPT = ROOT_DIR / "prompts" / "web-draft-task.txt"
 CHAT_ACTION_PROMPT = ROOT_DIR / "prompts" / "web-action-router.txt"
@@ -58,13 +66,14 @@ CHAT_ACTION_SCHEMA = ROOT_DIR / "schemas" / "lazyblog_action.schema.json"
 CODEX_RESPONSE_SCHEMA = ROOT_DIR / "schemas" / "lazyblog_codex_response.schema.json"
 CODEX_TRANSLATION_SCHEMA = ROOT_DIR / "schemas" / "lazyblog_web_translation.schema.json"
 ATTACHMENT_VISION_SCHEMA = ROOT_DIR / "schemas" / "lazyblog_attachment_vision.schema.json"
-DEFAULT_MODEL = "gpt-5.4"
+DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_REASONING = "low"
-DEFAULT_ACTION_MODEL = "gpt-5.4"
-DEFAULT_ACTION_REASONING = "medium"
+DEFAULT_ACTION_MODEL = "gpt-5.6-sol"
+DEFAULT_ACTION_REASONING = "low"
 DEFAULT_GIT_MODEL = "gpt-5.3-codex-spark"
 DEFAULT_GIT_REASONING = "medium"
 DEFAULT_MESSAGE_BATCH_SIZE = 10
+MAX_COMPOSER_TEXT_CHARS = 250_000
 MAX_ARTIFACT_TEXT_BYTES = 520_000
 MAX_ARTIFACT_BINARY_BYTES = 8_000_000
 ARTIFACT_ALLOWED_PREFIXES = (
@@ -90,11 +99,11 @@ ARTIFACT_SECRET_MARKERS = {
     "id_ed25519",
 }
 DEFAULT_PROFILE_SETTINGS = {
-    "reply": {"model": "gpt-5.5", "reasoning": "medium"},
-    "task": {"model": "gpt-5.5", "reasoning": "high"},
-    "action": {"model": "gpt-5.4", "reasoning": "medium"},
-    "response": {"model": "gpt-5.4", "reasoning": "medium"},
-    "translation": {"model": "gpt-5.4", "reasoning": "medium"},
+    "reply": {"model": "gpt-5.6-sol", "reasoning": "low"},
+    "task": {"model": "gpt-5.6-sol", "reasoning": "low"},
+    "action": {"model": "gpt-5.6-sol", "reasoning": "low"},
+    "response": {"model": "gpt-5.6-sol", "reasoning": "low"},
+    "translation": {"model": "gpt-5.6-sol", "reasoning": "low"},
 }
 REASONING_LEVELS = {"low", "medium", "high", "xhigh"}
 STUDIO_AUTH_COOKIE = "lazyblog_studio_auth"
@@ -662,6 +671,7 @@ class LazyBlogStudio:
         self.job_lock = threading.Lock()
         self.artifact_lock = threading.Lock()
         self.chat_queue_lock = threading.Lock()
+        self.composer_lock = threading.Lock()
         self.chat_queue_event = threading.Event()
         self.event_lock = threading.Condition()
         self.event_seq = 0
@@ -690,6 +700,101 @@ class LazyBlogStudio:
         write_json(self.session_meta_path(session_id), meta)
         self.emit_event("session_updated", session_id, {"session_id": safe_session_id(session_id)})
         self.emit_event("sessions_changed", "", {"session_id": safe_session_id(session_id)})
+
+    def composer_path(self, session_id: str) -> Path:
+        return self.session_dir(session_id) / "composer.json"
+
+    def composer_payload(self, session_id: str) -> dict[str, Any]:
+        safe_id = safe_session_id(session_id)
+        self.load_session(safe_id)
+        stored = read_json(self.composer_path(safe_id), {})
+        return {
+            "session_id": safe_id,
+            "text": str(stored.get("text") or ""),
+            "version": max(0, int(stored.get("version") or 0)),
+            "updated_at": str(stored.get("updated_at") or ""),
+            "client_id": str(stored.get("client_id") or ""),
+        }
+
+    def save_composer(
+        self,
+        text: str,
+        session_id: str | None = None,
+        *,
+        client_id: str = "",
+        base_version: int = 0,
+    ) -> dict[str, Any]:
+        clean_text = str(text or "")
+        if len(clean_text) > MAX_COMPOSER_TEXT_CHARS:
+            raise WebAppError(f"composer text exceeds {MAX_COMPOSER_TEXT_CHARS} characters")
+        clean_client_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(client_id or "browser"))[:100] or "browser"
+        safe_id = safe_session_id(session_id) if session_id else ""
+        created = False
+        if not safe_id:
+            if not clean_text.strip():
+                raise WebAppError("cannot create an empty chat composer")
+            session = self.create_session(clean_text)
+            safe_id = str(session["id"])
+            created = True
+
+        with self.composer_lock:
+            session = self.load_session(safe_id)
+            path = self.composer_path(safe_id)
+            current = read_json(path, {})
+            current_text = str(current.get("text") or "")
+            current_version = max(0, int(current.get("version") or 0))
+            current_client_id = str(current.get("client_id") or "")
+            stale_other_client = (
+                int(base_version or 0) < current_version
+                and clean_client_id != current_client_id
+                and clean_text != current_text
+            )
+            if stale_other_client:
+                conflict_dir = self.session_dir(safe_id) / "composer-conflicts"
+                write_json(
+                    conflict_dir / f"{stamp()}-{uuid.uuid4().hex[:8]}-{clean_client_id}.json",
+                    {
+                        "session_id": safe_id,
+                        "text": clean_text,
+                        "base_version": int(base_version or 0),
+                        "server_version": current_version,
+                        "client_id": clean_client_id,
+                        "created_at": now_iso(),
+                    },
+                )
+                return {
+                    "composer": self.composer_payload(safe_id),
+                    "session": session,
+                    "created": created,
+                    "conflict": True,
+                }
+
+            if clean_text != current_text or clean_client_id != current_client_id:
+                current_version += 1
+                current = {
+                    "session_id": safe_id,
+                    "text": clean_text,
+                    "version": current_version,
+                    "updated_at": now_iso(),
+                    "client_id": clean_client_id,
+                }
+                write_json(path, current)
+                self.emit_event(
+                    "composer_updated",
+                    safe_id,
+                    {
+                        "session_id": safe_id,
+                        "version": current_version,
+                        "client_id": clean_client_id,
+                    },
+                )
+
+        return {
+            "composer": self.composer_payload(safe_id),
+            "session": session,
+            "created": created,
+            "conflict": False,
+        }
 
     def emit_event(self, event_type: str, session_id: str = "", payload: dict[str, Any] | None = None) -> dict[str, Any]:
         safe_session = safe_session_id(session_id) if session_id else ""
@@ -1492,54 +1597,36 @@ Rules:
             }
             write_json(output_path, result)
             return result
-        cmd = [
-            "codex",
-            "exec",
-            "--ephemeral",
-            "--model",
-            "gpt-5.4",
-            "-c",
-            'model_reasoning_effort="medium"',
-            "--dangerously-bypass-approvals-and-sandbox",
-            "--cd",
-            str(ROOT_DIR),
-            "--output-schema",
-            str(ATTACHMENT_VISION_SCHEMA),
-            "--output-last-message",
-            str(output_path),
-            "--image",
-            str(image_path),
-            "-",
-        ]
         started = time.time()
-        proc = subprocess.run(
-            cmd,
-            input=full_prompt,
-            text=True,
-            cwd=ROOT_DIR,
-            capture_output=True,
-            timeout=self.args.codex_timeout,
-            check=False,
+        profile = self.codex_profile("response")
+        routed = self.run_structured_prompt(
+            full_prompt=full_prompt,
+            schema_path=ATTACHMENT_VISION_SCHEMA,
+            output_path=output_path,
+            model=profile["model"],
+            reasoning=profile["reasoning"],
+            extra_codex_args=["--image", str(image_path)],
+            allow_aginti=False,
         )
-        (run_dir / "stdout.log").write_text(proc.stdout or "", encoding="utf-8")
-        (run_dir / "stderr.log").write_text(proc.stderr or "", encoding="utf-8")
+        (run_dir / "stdout.log").write_text(str(routed.get("stdout") or ""), encoding="utf-8")
+        (run_dir / "stderr.log").write_text(str(routed.get("stderr") or ""), encoding="utf-8")
         write_json(
             run_dir / "run.json",
             {
                 "tool": "attachment-vision",
-                "model": "gpt-5.4",
-                "reasoning": "medium",
-                "returncode": proc.returncode,
+                "model": str(routed.get("route", {}).get("model") or profile["model"]),
+                "reasoning": str(routed.get("route", {}).get("reasoning") or profile["reasoning"]),
+                "route": routed.get("route"),
+                "attempts": routed.get("attempts", []),
+                "returncode": 0,
                 "elapsed_seconds": round(time.time() - started, 2),
                 "image": str(image_path.relative_to(ROOT_DIR)) if ROOT_DIR in image_path.parents else str(image_path),
                 "output": str(output_path.relative_to(ROOT_DIR)) if output_path.exists() else "",
             },
         )
-        if proc.returncode != 0:
-            raise WebAppError(f"attachment vision codex exec failed; see {run_dir.relative_to(ROOT_DIR)}")
         if not output_path.exists():
             raise WebAppError("attachment vision tool did not write output JSON")
-        return json.loads(output_path.read_text(encoding="utf-8"))
+        return read_json(output_path)
 
     def attachment_image_vision_markdown(self, attachment: dict[str, Any], vision: dict[str, Any]) -> str:
         name = str(attachment.get("name") or "attachment")
@@ -3329,6 +3416,188 @@ Rules:
         settings = self.load_model_settings()
         return dict(settings.get(profile, DEFAULT_PROFILE_SETTINGS.get(profile, DEFAULT_PROFILE_SETTINGS["response"])))
 
+    def codex_accounts(self) -> list[str]:
+        raw = os.environ.get("LAZYBLOG_CODEX_ACCOUNTS", "")
+        accounts: list[str] = []
+        for value in raw.split(","):
+            account = value.strip()
+            if account and re.fullmatch(r"[A-Za-z0-9_.-]+", account) and account not in accounts:
+                accounts.append(account)
+        return accounts
+
+    def structured_prompt_routes(self, model: str, reasoning: str) -> list[dict[str, str]]:
+        accounts = self.codex_accounts() if shutil.which("agent-run") else []
+        account_rows = accounts or [""]
+        model_rows = [(model, reasoning)]
+        fallback_model = os.environ.get("LAZYBLOG_CODEX_FALLBACK_MODEL", "gpt-5.3-codex-spark").strip()
+        fallback_reasoning = os.environ.get("LAZYBLOG_CODEX_FALLBACK_REASONING", "low").strip().lower()
+        if fallback_reasoning not in REASONING_LEVELS:
+            fallback_reasoning = "low"
+        if fallback_model and fallback_model != model:
+            model_rows.append((fallback_model, fallback_reasoning))
+        return [
+            {"provider": "codex", "account": account, "model": route_model, "reasoning": route_reasoning}
+            for route_model, route_reasoning in model_rows
+            for account in account_rows
+        ]
+
+    def run_structured_prompt(
+        self,
+        *,
+        full_prompt: str,
+        schema_path: Path,
+        output_path: Path,
+        model: str,
+        reasoning: str,
+        extra_codex_args: list[str] | None = None,
+        allow_aginti: bool = True,
+    ) -> dict[str, Any]:
+        started = time.monotonic()
+        attempts: list[dict[str, Any]] = []
+        stdout_parts: list[str] = []
+        stderr_parts: list[str] = []
+
+        for route in self.structured_prompt_routes(model, reasoning):
+            remaining = self.args.codex_timeout - (time.monotonic() - started)
+            if remaining <= 0:
+                break
+            output_path.unlink(missing_ok=True)
+            command = []
+            if route["account"]:
+                command.extend(["agent-run", "--account", route["account"]])
+            command.extend(
+                [
+                    "codex",
+                    "exec",
+                    "--ephemeral",
+                    "--model",
+                    route["model"],
+                    "-c",
+                    f'model_reasoning_effort="{route["reasoning"]}"',
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "--cd",
+                    str(ROOT_DIR),
+                    "--output-schema",
+                    str(schema_path),
+                    "--output-last-message",
+                    str(output_path),
+                ]
+            )
+            command.extend(extra_codex_args or [])
+            command.append("-")
+            try:
+                proc = subprocess.run(
+                    command,
+                    input=full_prompt,
+                    text=True,
+                    cwd=ROOT_DIR,
+                    capture_output=True,
+                    timeout=max(1, int(remaining)),
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                raise WebAppError("Codex route timed out; the prompt was not replayed on another provider")
+            stdout_parts.append(proc.stdout or "")
+            stderr_parts.append(proc.stderr or "")
+            valid_output = False
+            if proc.returncode == 0 and output_path.is_file():
+                try:
+                    valid_output = isinstance(read_json(output_path), dict)
+                except (json.JSONDecodeError, OSError):
+                    valid_output = False
+            attempts.append(
+                {
+                    **route,
+                    "status": "succeeded" if valid_output else "failed",
+                    "returncode": proc.returncode,
+                }
+            )
+            if valid_output:
+                return {
+                    "output": read_json(output_path),
+                    "route": route,
+                    "attempts": attempts,
+                    "stdout": "\n".join(stdout_parts),
+                    "stderr": "\n".join(stderr_parts),
+                }
+
+        aginti_enabled = bool_env("LAZYBLOG_AGINTI_DEEPSEEK_FALLBACK", False)
+        if allow_aginti and aginti_enabled and shutil.which("aginti"):
+            remaining = self.args.codex_timeout - (time.monotonic() - started)
+            if remaining > 0:
+                output_path.unlink(missing_ok=True)
+                deepseek_model = os.environ.get("LAZYBLOG_AGINTI_DEEPSEEK_MODEL", "deepseek-v4-flash").strip() or "deepseek-v4-flash"
+                schema_prompt = (
+                    full_prompt
+                    + "\n\nThe preceding output contract is mandatory. Return only one JSON object matching this JSON Schema:\n"
+                    + schema_path.read_text(encoding="utf-8")
+                    + "\n"
+                )
+                command = [
+                    "aginti",
+                    "run",
+                    "--stdin",
+                    "--json",
+                    "--task-profile",
+                    "chatops",
+                    "--no-scs",
+                    "-s",
+                    "safe",
+                    "--provider",
+                    "deepseek",
+                    "--routing",
+                    "manual",
+                    "--model",
+                    deepseek_model,
+                ]
+                try:
+                    proc = subprocess.run(
+                        command,
+                        input=schema_prompt,
+                        text=True,
+                        cwd=ROOT_DIR,
+                        capture_output=True,
+                        timeout=max(1, int(remaining)),
+                        check=False,
+                    )
+                except subprocess.TimeoutExpired:
+                    raise WebAppError("AgInTi DeepSeek fallback timed out")
+                stdout_parts.append(proc.stdout or "")
+                stderr_parts.append(proc.stderr or "")
+                valid_output = False
+                parsed_output: dict[str, Any] = {}
+                if proc.returncode == 0:
+                    try:
+                        envelope = json.loads(proc.stdout)
+                        raw_result = envelope.get("result") if isinstance(envelope, dict) else ""
+                        if isinstance(raw_result, dict):
+                            parsed_output = raw_result
+                        else:
+                            clean_result = re.sub(r"^```(?:json)?\s*|\s*```$", "", str(raw_result or "").strip(), flags=re.IGNORECASE)
+                            parsed_output = json.loads(clean_result)
+                        valid_output = isinstance(parsed_output, dict)
+                    except (json.JSONDecodeError, TypeError, AttributeError):
+                        valid_output = False
+                route = {"provider": "aginti-deepseek", "account": "", "model": deepseek_model, "reasoning": "provider-default"}
+                attempts.append(
+                    {
+                        **route,
+                        "status": "succeeded" if valid_output else "failed",
+                        "returncode": proc.returncode,
+                    }
+                )
+                if valid_output:
+                    write_json(output_path, parsed_output)
+                    return {
+                        "output": parsed_output,
+                        "route": route,
+                        "attempts": attempts,
+                        "stdout": "\n".join(stdout_parts),
+                        "stderr": "\n".join(stderr_parts),
+                    }
+
+        raise WebAppError("all configured Codex and AgInTi DeepSeek routes failed")
+
     def profile_for_tool(self, tool_name: str, schema_name: str = "") -> dict[str, str]:
         if schema_name == "translation":
             return self.codex_profile("translation")
@@ -3536,43 +3805,26 @@ Rules:
                 )
                 return
 
-            cmd = [
-                "codex",
-                "exec",
-                "--ephemeral",
-                "--model",
-                str(job["model"]),
-                "-c",
-                f'model_reasoning_effort="{job["reasoning"]}"',
-                "--dangerously-bypass-approvals-and-sandbox",
-                "--cd",
-                str(ROOT_DIR),
-                "--output-schema",
-                str(schema_path),
-                "--output-last-message",
-                str(job_dir / "output.json"),
-                "-",
-            ]
-            proc = subprocess.run(
-                cmd,
-                input=full_prompt,
-                text=True,
-                cwd=ROOT_DIR,
-                capture_output=True,
-                timeout=self.args.codex_timeout,
-                check=False,
+            routed = self.run_structured_prompt(
+                full_prompt=full_prompt,
+                schema_path=schema_path,
+                output_path=job_dir / "output.json",
+                model=str(job["model"]),
+                reasoning=str(job["reasoning"]),
             )
-            (job_dir / "stdout.log").write_text(proc.stdout or "", encoding="utf-8")
-            (job_dir / "stderr.log").write_text(proc.stderr or "", encoding="utf-8")
-            status = "succeeded" if proc.returncode == 0 and (job_dir / "output.json").exists() else "failed"
+            (job_dir / "stdout.log").write_text(str(routed.get("stdout") or ""), encoding="utf-8")
+            (job_dir / "stderr.log").write_text(str(routed.get("stderr") or ""), encoding="utf-8")
+            status = "succeeded" if (job_dir / "output.json").exists() else "failed"
             updates: dict[str, Any] = {
                 "status": status,
                 "finished_at": now_iso(),
                 "elapsed_seconds": round(time.time() - started, 2),
-                "returncode": proc.returncode,
+                "returncode": 0 if status == "succeeded" else 1,
+                "route": routed.get("route"),
+                "attempts": routed.get("attempts", []),
             }
             if status == "failed":
-                updates["error"] = f"codex exec failed with returncode {proc.returncode}"
+                updates["error"] = "all structured prompt routes failed"
             elif (job_dir / "output.json").exists():
                 try:
                     self.register_job_output_artifacts(job, read_json(job_dir / "output.json"))
@@ -3745,51 +3997,32 @@ Rules:
         profile = self.profile_for_tool(tool_name)
         resolved_model = model or profile["model"]
         resolved_reasoning = reasoning or profile["reasoning"]
-        cmd = [
-            "codex",
-            "exec",
-            "--ephemeral",
-            "--model",
-            resolved_model,
-            "-c",
-            f'model_reasoning_effort="{resolved_reasoning}"',
-            "--dangerously-bypass-approvals-and-sandbox",
-            "--cd",
-            str(ROOT_DIR),
-            "--output-schema",
-            str(schema_path),
-            "--output-last-message",
-            str(output_path),
-            "-",
-        ]
         started = time.time()
-        proc = subprocess.run(
-            cmd,
-            input=full_prompt,
-            text=True,
-            cwd=ROOT_DIR,
-            capture_output=True,
-            timeout=self.args.codex_timeout,
-            check=False,
+        routed = self.run_structured_prompt(
+            full_prompt=full_prompt,
+            schema_path=schema_path,
+            output_path=output_path,
+            model=resolved_model,
+            reasoning=resolved_reasoning,
         )
-        (run_dir / "stdout.log").write_text(proc.stdout or "", encoding="utf-8")
-        (run_dir / "stderr.log").write_text(proc.stderr or "", encoding="utf-8")
+        (run_dir / "stdout.log").write_text(str(routed.get("stdout") or ""), encoding="utf-8")
+        (run_dir / "stderr.log").write_text(str(routed.get("stderr") or ""), encoding="utf-8")
         write_json(
             run_dir / "run.json",
             {
                 "tool": tool_name,
-                "model": resolved_model,
-                "reasoning": resolved_reasoning,
-                "returncode": proc.returncode,
+                "model": str(routed.get("route", {}).get("model") or resolved_model),
+                "reasoning": str(routed.get("route", {}).get("reasoning") or resolved_reasoning),
+                "route": routed.get("route"),
+                "attempts": routed.get("attempts", []),
+                "returncode": 0,
                 "elapsed_seconds": round(time.time() - started, 2),
                 "output": str(output_path.relative_to(ROOT_DIR)) if output_path.exists() else "",
             },
         )
-        if proc.returncode != 0:
-            raise WebAppError(f"{tool_name} codex exec failed; see {run_dir.relative_to(ROOT_DIR)}")
         if not output_path.exists():
             raise WebAppError(f"{tool_name} did not write output JSON")
-        return json.loads(output_path.read_text(encoding="utf-8"))
+        return read_json(output_path)
 
     def mock_tool(self, tool_name: str, payload: dict[str, Any]) -> dict[str, Any]:
         if tool_name == "action":
@@ -5057,46 +5290,49 @@ INDEX_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#0f766e">
+  <meta name="theme-color" content="#16a394">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-title" content="LazyBlog Studio">
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/icons/lazyblog.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="/icons/lazyblog.svg">
+  <link rel="stylesheet" href="/assets/vendor/katex.css">
+  <script src="/assets/vendor/marked.js"></script>
+  <script src="/assets/vendor/dompurify.js"></script>
+  <script src="/assets/vendor/katex.js"></script>
+  <script src="/assets/vendor/katex-auto-render.js"></script>
   <title>LazyBlog Studio</title>
   <style>
     @import url("https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,650&family=Newsreader:opsz,wght@6..72,400;6..72,600&display=swap");
     :root {
-      --ink: #1d2520;
-      --muted: #667069;
-      --paper: #fffaf0;
-      --line: rgba(39, 55, 46, 0.16);
-      --teal: #0f766e;
-      --teal-dark: #0b4f4a;
-      --clay: #d96b43;
-      --gold: #e3a92f;
-      --shadow: 0 24px 70px rgba(28, 45, 38, 0.16);
+      --ink: #15231e;
+      --muted: #607069;
+      --paper: #ffffff;
+      --surface: #f4fbf8;
+      --line: rgba(31, 71, 58, 0.16);
+      --teal: #16a394;
+      --teal-dark: #08776c;
+      --coral: #f06449;
+      --sun: #ffc857;
+      --shadow: 0 18px 50px rgba(22, 79, 62, 0.12);
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       color: var(--ink);
       font-family: "Newsreader", Georgia, serif;
-      background:
-        radial-gradient(circle at 12% 16%, rgba(227, 169, 47, 0.28), transparent 26rem),
-        radial-gradient(circle at 92% 12%, rgba(15, 118, 110, 0.18), transparent 24rem),
-        linear-gradient(135deg, #fffaf0 0%, #f3ead7 52%, #d9ede8 100%);
+      background: #edf8f4;
       min-height: 100vh;
       overflow-x: hidden;
     }
     button, input, textarea, select { font: inherit; }
     .shell { display: grid; grid-template-columns: 260px minmax(0, 1fr) 360px; gap: 18px; width: 100%; max-width: 100vw; height: 100vh; padding: 20px; overflow: hidden; }
-    .panel { min-width: 0; background: rgba(255, 250, 240, 0.82); border: 1px solid var(--line); border-radius: 28px; box-shadow: var(--shadow); backdrop-filter: blur(18px); overflow: hidden; }
+    .panel { min-width: 0; background: rgba(255, 255, 255, 0.96); border: 1px solid var(--line); border-radius: 18px; box-shadow: var(--shadow); backdrop-filter: blur(18px); overflow: hidden; }
     .side, .publish { min-width: 0; max-height: calc(100vh - 40px); padding: 18px; overflow-y: auto; }
-    .brand { padding: 22px; border-bottom: 1px solid var(--line); background: linear-gradient(135deg, rgba(15, 118, 110, 0.12), rgba(217, 107, 67, 0.12)); }
+    .brand { padding: 22px; border-bottom: 1px solid var(--line); background: #e8f8f3; }
     h1, h2 { font-family: "Fraunces", Georgia, serif; line-height: 1; margin: 0; }
-    h1 { font-size: 34px; letter-spacing: -0.05em; }
-    h2 { font-size: 20px; letter-spacing: -0.03em; }
+    h1 { font-size: 34px; letter-spacing: 0; }
+    h2 { font-size: 20px; letter-spacing: 0; }
     .sub { color: var(--muted); margin: 10px 0 0; font-size: 15px; }
     .session-list { display: grid; gap: 10px; margin-top: 16px; }
     .session { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; border: 1px solid var(--line); border-radius: 18px; padding: 12px; cursor: pointer; background: rgba(255, 255, 255, 0.42); transition: transform 160ms ease, border-color 160ms ease, background 160ms ease; }
@@ -5139,11 +5375,32 @@ INDEX_HTML = r"""<!doctype html>
     .more-messages.visible { display: inline-flex; }
     .more-messages.loading { cursor: wait; opacity: 0.7; }
     .msg { min-width: 0; max-width: min(760px, 88%); padding: 14px 16px; border-radius: 22px; border: 1px solid var(--line); white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; line-height: 1.48; animation: rise 220ms ease both; }
-    .msg.user { align-self: flex-end; background: linear-gradient(135deg, rgba(15, 118, 110, 0.93), rgba(11, 79, 74, 0.93)); color: white; border-color: rgba(15, 118, 110, 0.3); }
+    .msg.user { align-self: flex-end; background: #087f74; color: white; border-color: rgba(8, 119, 108, 0.34); }
     .msg.assistant { align-self: flex-start; background: rgba(255, 255, 255, 0.62); }
     .msg.failed { border-color: rgba(167, 43, 43, 0.4); background: rgba(255, 232, 226, 0.72); color: #7a241d; }
     .msg-body { position: relative; min-width: 0; }
-    .msg-content { white-space: pre-wrap; margin: 0 20px 0 0; min-height: 18px; }
+    .msg-content { white-space: normal; margin: 0 20px 0 0; min-height: 18px; }
+    .msg-content > :first-child { margin-top: 0; }
+    .msg-content > :last-child { margin-bottom: 0; }
+    .msg-content p, .msg-content ul, .msg-content ol, .msg-content blockquote, .msg-content pre, .msg-content table { margin: 0.58em 0; }
+    .msg-content h1, .msg-content h2, .msg-content h3, .msg-content h4 { margin: 0.8em 0 0.35em; line-height: 1.2; letter-spacing: 0; }
+    .msg-content h1 { font-size: 1.45em; }
+    .msg-content h2 { font-size: 1.28em; }
+    .msg-content h3 { font-size: 1.14em; }
+    .msg-content ul, .msg-content ol { padding-left: 1.4em; }
+    .msg-content blockquote { padding: 0.18em 0 0.18em 0.8em; border-left: 3px solid rgba(22, 163, 148, 0.5); color: var(--muted); }
+    .msg-content code { padding: 0.12em 0.32em; border-radius: 5px; background: rgba(21, 35, 30, 0.09); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.88em; }
+    .msg-content pre { max-width: 100%; padding: 10px 12px; overflow-x: auto; border-radius: 8px; background: #17251f; color: #f1f8f5; }
+    .msg-content pre code { padding: 0; background: transparent; color: inherit; }
+    .msg-content table { display: block; width: 100%; max-width: 100%; overflow-x: auto; border-collapse: collapse; }
+    .msg-content th, .msg-content td { padding: 6px 8px; border: 1px solid rgba(31, 71, 58, 0.2); text-align: left; }
+    .msg-content th { background: rgba(22, 163, 148, 0.1); }
+    .msg-content a { color: var(--teal-dark); text-decoration: underline; text-underline-offset: 2px; }
+    .msg-content img { display: block; max-width: 100%; max-height: min(42vh, 360px); border-radius: 8px; object-fit: contain; }
+    .msg-content .katex-display { max-width: 100%; overflow-x: auto; overflow-y: hidden; padding: 0.2em 0; }
+    .msg.user .msg-content a { color: #fff7bb; }
+    .msg.user .msg-content blockquote { color: rgba(255, 255, 255, 0.82); border-left-color: rgba(255, 255, 255, 0.58); }
+    .msg.user .msg-content code { background: rgba(255, 255, 255, 0.17); }
     .msg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
     .msg-quote-action { width: 34px; height: 34px; min-width: 34px; padding: 0; border: 0; border-radius: 999px; background: rgba(29, 37, 32, 0.08); color: currentColor; cursor: pointer; opacity: 0.9; line-height: 1; font-size: 20px; font-weight: 600; }
     .msg-quote-action:hover { opacity: 1; background: rgba(29, 37, 32, 0.14); }
@@ -5166,7 +5423,7 @@ INDEX_HTML = r"""<!doctype html>
     .attachment-pdf-frame { width: 100%; min-height: 180px; border: 0; border-radius: 10px; background: rgba(255, 255, 255, 0.8); }
     .attachment-video-thumb { position: relative; display: block; }
     .attachment-video-thumb::after { content: "▶"; position: absolute; right: 12px; bottom: 12px; width: 34px; height: 34px; display: inline-flex; align-items: center; justify-content: center; border-radius: 999px; background: rgba(22, 30, 25, 0.72); color: white; font-size: 16px; }
-    .composer { min-width: 0; max-width: 100%; padding: 18px; border-top: 1px solid var(--line); background: rgba(255, 244, 217, 0.58); overflow: hidden; }
+    .composer { min-width: 0; max-width: 100%; padding: 18px; border-top: 1px solid var(--line); background: #f2faf7; overflow: hidden; }
     textarea { width: 100%; min-height: 108px; resize: vertical; border: 1px solid rgba(39, 55, 46, 0.18); border-radius: 20px; background: rgba(255, 255, 255, 0.72); color: var(--ink); padding: 14px 15px; outline: none; line-height: 1.45; }
     textarea:focus, select:focus, input:focus { border-color: rgba(15, 118, 110, 0.55); box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.12); }
     .row { display: flex; gap: 10px; align-items: center; margin-top: 12px; }
@@ -5175,6 +5432,12 @@ INDEX_HTML = r"""<!doctype html>
     .attach-btn { width: 40px; height: 40px; min-width: 40px; padding: 0; border-radius: 999px; font-size: 19px; line-height: 1; display: inline-flex; align-items: center; justify-content: center; }
     .attach-btn[title] { text-decoration: none; }
     .attach-btn:hover { transform: none; }
+    .attach-btn svg { width: 20px; height: 20px; pointer-events: none; }
+    .mic-btn.listening { background: var(--coral); color: white; animation: mic-pulse 1.35s ease-in-out infinite; }
+    .composer-sync-status { margin-left: auto; min-width: 0; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .composer-sync-status.saving { color: #8a5c00; }
+    .composer-sync-status.saved { color: var(--teal-dark); }
+    .composer-sync-status.error { color: #a52d1f; }
     .attach-hint { margin-left: 2px; }
     .attachment-pills { display: flex; flex-wrap: wrap; gap: 6px; }
     .attachment-pill { display: inline-flex; align-items: center; gap: 8px; border-radius: 999px; padding: 6px 10px; border: 1px solid var(--line); background: rgba(255, 255, 255, 0.72); max-width: 100%; }
@@ -5191,7 +5454,7 @@ INDEX_HTML = r"""<!doctype html>
     .composer-reply { margin-top: 10px; border-radius: 18px; border: 1px solid rgba(15, 118, 110, 0.16); background: rgba(255, 255, 255, 0.64); padding: 10px 12px; }
     .composer-reply[hidden] { display: none; }
     .composer-reply-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
-    .composer-reply-label { font-size: 12px; font-weight: 700; color: var(--teal-dark); text-transform: uppercase; letter-spacing: 0.04em; }
+    .composer-reply-label { font-size: 12px; font-weight: 700; color: var(--teal-dark); text-transform: uppercase; letter-spacing: 0; }
     .composer-reply-clear { width: 28px; height: 28px; min-width: 28px; padding: 0; border-radius: 999px; background: rgba(29, 37, 32, 0.08); color: var(--ink); }
     .composer-reply-preview { margin-top: 6px; color: var(--ink); font-size: 14px; line-height: 1.38; white-space: pre-wrap; overflow-wrap: anywhere; }
     .file-input { display: none; }
@@ -5199,7 +5462,7 @@ INDEX_HTML = r"""<!doctype html>
     button:hover { transform: translateY(-1px); }
     button:disabled { opacity: 0.55; cursor: wait; transform: none; }
     .secondary { background: rgba(29, 37, 32, 0.08); color: var(--ink); }
-    .accent { background: linear-gradient(135deg, var(--clay), var(--gold)); color: #231b12; font-weight: 600; }
+    .accent { background: var(--sun); color: #352500; font-weight: 700; }
     .publish-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
     .publish-close { display: none; }
     .field { margin-top: 16px; }
@@ -5238,7 +5501,7 @@ INDEX_HTML = r"""<!doctype html>
     .artifact-help { margin: 8px 0 0; }
     .artifact-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
     .artifact-tab { padding: 8px 12px; background: rgba(29, 37, 32, 0.08); color: var(--ink); }
-    .artifact-tab.active { background: linear-gradient(135deg, rgba(15, 118, 110, 0.96), rgba(11, 79, 74, 0.96)); color: white; }
+    .artifact-tab.active { background: var(--teal-dark); color: white; }
     .artifact-layout { display: grid; grid-template-columns: minmax(220px, 0.34fr) minmax(0, 1fr); gap: 12px; margin-top: 12px; min-height: min(68vh, 720px); }
     .artifact-list-panel, .artifact-viewer { min-width: 0; border: 1px solid var(--line); border-radius: 20px; background: rgba(255, 255, 255, 0.5); overflow: hidden; }
     .artifact-list-panel { display: grid; grid-template-rows: auto minmax(0, 1fr); }
@@ -5260,9 +5523,9 @@ INDEX_HTML = r"""<!doctype html>
     .artifact-viewer { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; }
     .artifact-viewer-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
     .artifact-viewer-actions { display: inline-flex; align-items: center; gap: 8px; }
-    .artifact-viewer-header h3 { margin: 0; font-family: "Fraunces", Georgia, serif; font-size: 22px; letter-spacing: -0.03em; overflow-wrap: anywhere; }
+    .artifact-viewer-header h3 { margin: 0; font-family: "Fraunces", Georgia, serif; font-size: 22px; letter-spacing: 0; overflow-wrap: anywhere; }
     .artifact-viewer-body { min-width: 0; min-height: 0; padding: 12px; overflow: auto; }
-    .artifact-image-frame { margin: 0; min-height: 340px; display: grid; place-items: center; border-radius: 18px; background: radial-gradient(circle at 20% 10%, rgba(227, 169, 47, 0.2), transparent 22rem), rgba(22, 30, 25, 0.08); }
+    .artifact-image-frame { margin: 0; min-height: 340px; display: grid; place-items: center; border-radius: 18px; background: #edf7f3; }
     .artifact-preview-image { display: block; max-width: 100%; max-height: min(66vh, 760px); object-fit: contain; border-radius: 14px; box-shadow: 0 18px 46px rgba(22, 30, 25, 0.16); }
     .artifact-video { display: block; width: 100%; max-height: min(66vh, 760px); border-radius: 14px; background: #111; }
     .artifact-pdf-frame { display: block; width: 100%; min-height: min(66vh, 760px); border: 0; border-radius: 14px; background: white; }
@@ -5277,12 +5540,13 @@ INDEX_HTML = r"""<!doctype html>
     .mobile-menu-toggle, .mobile-publish-toggle, .mobile-top-title { display: none; }
     .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
     @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+    @keyframes mic-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(240, 100, 73, 0.28); } 50% { box-shadow: 0 0 0 7px rgba(240, 100, 73, 0); } }
     @media (max-width: 1080px) { .shell { grid-template-columns: 1fr; } .chat { min-height: 70vh; } .publish { order: 3; } }
     @media (max-width: 720px) {
-      .shell { display: block; height: 100svh; padding: 52px 8px 8px; overflow: hidden; }
+      .shell { display: block; height: 100svh; padding: calc(52px + env(safe-area-inset-top)) 8px max(8px, env(safe-area-inset-bottom)); overflow: hidden; }
       .mobile-menu-toggle {
         position: fixed;
-        top: 10px;
+        top: calc(10px + env(safe-area-inset-top));
         left: 10px;
         z-index: 40;
         display: inline-flex;
@@ -5301,7 +5565,7 @@ INDEX_HTML = r"""<!doctype html>
       .mobile-menu-toggle span { width: 18px; height: 2px; border-radius: 999px; background: currentColor; }
       .mobile-top-title {
         position: fixed;
-        top: 10px;
+        top: calc(10px + env(safe-area-inset-top));
         left: 60px;
         right: 10px;
         z-index: 39;
@@ -5315,7 +5579,7 @@ INDEX_HTML = r"""<!doctype html>
         box-shadow: 0 12px 30px rgba(28, 45, 38, 0.1);
         font-family: "Fraunces", Georgia, serif;
         font-size: 18px;
-        letter-spacing: -0.04em;
+        letter-spacing: 0;
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
@@ -5337,7 +5601,7 @@ INDEX_HTML = r"""<!doctype html>
       .session { padding: 9px 10px; border-radius: 14px; }
       .session strong { font-size: 14px; }
       .chat {
-        height: calc(100svh - 60px);
+        height: calc(100svh - 60px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
         min-height: 0;
         grid-template-rows: auto minmax(0, 1fr) auto;
         border-radius: 22px;
@@ -5356,12 +5620,16 @@ INDEX_HTML = r"""<!doctype html>
       .msg { max-width: 96%; padding: 10px 11px; border-radius: 16px; line-height: 1.38; }
       .msg.user { max-width: 94%; }
       .composer {
-        padding: 8px;
-        background: rgba(255, 244, 217, 0.88);
+        padding: 8px 8px max(8px, env(safe-area-inset-bottom));
+        background: rgba(242, 250, 247, 0.96);
       }
       .composer-reply { padding: 8px 10px; border-radius: 14px; }
       .composer-reply-preview { font-size: 13px; }
       textarea { min-height: 72px; max-height: 32vh; border-radius: 16px; padding: 10px 11px; }
+      .attach-row { flex-wrap: nowrap; min-width: 0; }
+      .attach-btn { width: 42px; height: 42px; min-width: 42px; }
+      .attach-hint { display: none; }
+      .composer-sync-status { margin-left: 0; flex: 1 1 auto; text-align: right; }
       .composer .row { position: relative; flex-wrap: nowrap; gap: 6px; margin-top: 8px; padding-bottom: 16px; align-items: center; }
       .composer .row button { min-width: 0; padding: 9px 10px; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       #sendButton { flex: 1 1 44%; }
@@ -5459,7 +5727,15 @@ INDEX_HTML = r"""<!doctype html>
         <input id="attachmentInput" class="file-input" type="file" multiple>
         <div class="attach-row">
           <button id="attachAnyButton" class="secondary attach-btn" type="button" aria-label="Attach file" title="Attach file">＋</button>
+          <button id="micButton" class="secondary attach-btn mic-btn" type="button" aria-label="Start voice input" title="Start voice input">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"></path>
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+              <path d="M12 19v3"></path>
+            </svg>
+          </button>
           <span id="attachmentHint" class="sub attach-hint">Attach files, images, or video</span>
+          <span id="composerStatus" class="composer-sync-status" role="status" aria-live="polite">Saved locally</span>
         </div>
         <div id="attachmentPills" class="attachment-pills" hidden></div>
         <div id="attachmentPreviewArea" class="attachment-preview-area" hidden></div>
@@ -5580,7 +5856,7 @@ INDEX_HTML = r"""<!doctype html>
           <strong>Chat Reply</strong>
           <p class="sub">Normal chat replies in the Studio.</p>
           <div class="settings-row">
-            <input id="settingsReplyModel" placeholder="gpt-5.5">
+            <input id="settingsReplyModel" placeholder="gpt-5.6-sol">
             <select id="settingsReplyReasoning"><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option></select>
           </div>
         </div>
@@ -5588,7 +5864,7 @@ INDEX_HTML = r"""<!doctype html>
           <strong>Write Assistant</strong>
           <p class="sub">Drafting and revising posts from chat context.</p>
           <div class="settings-row">
-            <input id="settingsTaskModel" placeholder="gpt-5.5">
+            <input id="settingsTaskModel" placeholder="gpt-5.6-sol">
             <select id="settingsTaskReasoning"><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option></select>
           </div>
         </div>
@@ -5596,7 +5872,7 @@ INDEX_HTML = r"""<!doctype html>
           <strong>Router / Clarification</strong>
           <p class="sub">Action routing, sanity checks, and clarification decisions.</p>
           <div class="settings-row">
-            <input id="settingsActionModel" placeholder="gpt-5.4">
+            <input id="settingsActionModel" placeholder="gpt-5.6-sol">
             <select id="settingsActionReasoning"><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option></select>
           </div>
         </div>
@@ -5604,7 +5880,7 @@ INDEX_HTML = r"""<!doctype html>
           <strong>General Response API</strong>
           <p class="sub">Direct response-style Codex API calls.</p>
           <div class="settings-row">
-            <input id="settingsResponseModel" placeholder="gpt-5.4">
+            <input id="settingsResponseModel" placeholder="gpt-5.6-sol">
             <select id="settingsResponseReasoning"><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option></select>
           </div>
         </div>
@@ -5612,7 +5888,7 @@ INDEX_HTML = r"""<!doctype html>
           <strong>Translation</strong>
           <p class="sub">On-demand translation jobs.</p>
           <div class="settings-row">
-            <input id="settingsTranslationModel" placeholder="gpt-5.4">
+            <input id="settingsTranslationModel" placeholder="gpt-5.6-sol">
             <select id="settingsTranslationReasoning"><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option></select>
           </div>
         </div>
@@ -5711,11 +5987,204 @@ INDEX_HTML = r"""<!doctype html>
       selectedArtifactId: "",
       artifactTab: "canvas",
       artifactSignature: "",
-      artifactUnreadCount: 0
+      artifactUnreadCount: 0,
+      composerClientId: "",
+      composerVersion: 0,
+      composerDirty: false,
+      composerLoadedSessionId: "",
+      composerSyncTimer: null,
+      composerSaveInFlight: null,
+      composerSaveAgain: false,
+      speechRecognition: null,
+      speechSupported: false,
+      speechActive: false,
+      speechKeepAlive: false,
+      speechBaseText: "",
+      speechFinalText: ""
     };
     const $ = (id) => document.getElementById(id);
     const shell = $("shell");
+    state.composerClientId = browserClientId();
     $("modelLabel").textContent = "__MODEL_LABEL__";
+
+    function browserClientId() {
+      const key = "lazyblog.studio.browserClientId";
+      try {
+        let value = localStorage.getItem(key) || "";
+        if (!value) {
+          value = globalThis.crypto && typeof globalThis.crypto.randomUUID === "function"
+            ? globalThis.crypto.randomUUID()
+            : `browser-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+          localStorage.setItem(key, value);
+        }
+        return value;
+      } catch {
+        return `browser-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      }
+    }
+
+    function composerStorageKey(sessionId = state.sessionId || "new") {
+      return `lazyblog.studio.composer.${sessionId || "new"}`;
+    }
+
+    function readLocalComposer(sessionId = state.sessionId || "new") {
+      try {
+        const parsed = JSON.parse(localStorage.getItem(composerStorageKey(sessionId)) || "null");
+        return parsed && typeof parsed.text === "string" ? parsed : null;
+      } catch {
+        return null;
+      }
+    }
+
+    function persistLocalComposer(text, options = {}) {
+      try {
+        localStorage.setItem(composerStorageKey(options.sessionId), JSON.stringify({
+          text: String(text || ""),
+          updated_at_ms: Date.now(),
+          server_version: Number(options.serverVersion ?? state.composerVersion) || 0,
+          synced: Boolean(options.synced)
+        }));
+      } catch {
+        // The server copy remains available when browser storage is unavailable.
+      }
+    }
+
+    function clearLocalComposer(sessionId = state.sessionId || "new") {
+      try {
+        localStorage.removeItem(composerStorageKey(sessionId));
+      } catch {}
+    }
+
+    function setComposerStatus(message, kind = "") {
+      const root = $("composerStatus");
+      root.textContent = message || "";
+      root.className = `composer-sync-status${kind ? ` ${kind}` : ""}`;
+    }
+
+    function scheduleComposerSave(delay = 450) {
+      if (state.composerSyncTimer) clearTimeout(state.composerSyncTimer);
+      state.composerSyncTimer = setTimeout(() => {
+        state.composerSyncTimer = null;
+        saveComposerDraft().catch(() => {});
+      }, delay);
+    }
+
+    function composerInputChanged() {
+      state.composerDirty = true;
+      persistLocalComposer($("messageInput").value, { synced: false });
+      setComposerStatus(navigator.onLine ? "Saving draft..." : "Saved on this device", navigator.onLine ? "saving" : "error");
+      scheduleComposerSave();
+    }
+
+    async function saveComposerDraft(options = {}) {
+      const input = $("messageInput");
+      const text = input.value;
+      if (!state.sessionId && !text.trim()) {
+        persistLocalComposer(text, { sessionId: "new", synced: false });
+        setComposerStatus("Saved on this device", "saved");
+        return null;
+      }
+      if (state.composerSaveInFlight) {
+        state.composerSaveAgain = true;
+        return state.composerSaveInFlight;
+      }
+      if (state.composerSyncTimer) {
+        clearTimeout(state.composerSyncTimer);
+        state.composerSyncTimer = null;
+      }
+      const sourceSessionId = state.sessionId || "";
+      const sourceStorageId = sourceSessionId || "new";
+      const sentText = text;
+      const sentVersion = state.composerVersion;
+      setComposerStatus("Saving draft...", "saving");
+      state.composerSaveInFlight = api("/api/composer", {
+        session_id: sourceSessionId,
+        text: sentText,
+        client_id: state.composerClientId,
+        base_version: sentVersion
+      });
+      try {
+        const data = await state.composerSaveInFlight;
+        const composer = data.composer || {};
+        const newSessionId = composer.session_id || (data.session && data.session.id) || sourceSessionId;
+        if (!sourceSessionId && newSessionId && !state.sessionId) {
+          state.sessionId = newSessionId;
+          state.composerLoadedSessionId = newSessionId;
+          const previousLocal = readLocalComposer("new");
+          if (previousLocal) {
+            localStorage.setItem(composerStorageKey(newSessionId), JSON.stringify(previousLocal));
+          }
+          clearLocalComposer("new");
+          $("chatTitle").textContent = data.session && data.session.title ? data.session.title : "Untitled chat";
+          $("chatMeta").textContent = `0 messages stored in content/chat/${newSessionId} · composer saved`;
+          startEventStream(true);
+          loadSessions().catch(() => {});
+        }
+        if (newSessionId === state.sessionId) {
+          state.composerVersion = Number(composer.version) || 0;
+        }
+        if (data.conflict) {
+          state.composerDirty = true;
+          persistLocalComposer(input.value, { synced: false });
+          setComposerStatus("Saved locally; another device changed this draft", "error");
+          return data;
+        }
+        if (newSessionId === state.sessionId && input.value === sentText) {
+          state.composerDirty = false;
+          persistLocalComposer(sentText, { serverVersion: state.composerVersion, synced: true });
+          setComposerStatus("Draft saved", "saved");
+        } else if (newSessionId === state.sessionId) {
+          state.composerDirty = true;
+          persistLocalComposer(input.value, { synced: false });
+          state.composerSaveAgain = true;
+        }
+        return data;
+      } catch (error) {
+        state.composerDirty = true;
+        persistLocalComposer(input.value, { sessionId: sourceStorageId, synced: false });
+        setComposerStatus("Saved on this device; server unavailable", "error");
+        if (options.throwOnError) throw error;
+        return null;
+      } finally {
+        state.composerSaveInFlight = null;
+        if (state.composerSaveAgain) {
+          state.composerSaveAgain = false;
+          scheduleComposerSave(120);
+        }
+      }
+    }
+
+    async function loadComposerDraft(options = {}) {
+      const sessionId = state.sessionId;
+      if (!sessionId) {
+        const local = readLocalComposer("new");
+        $("messageInput").value = local ? local.text : "";
+        state.composerVersion = 0;
+        state.composerDirty = Boolean(local && local.text);
+        setComposerStatus(local && local.text ? "Recovered on this device" : "Saved locally", "saved");
+        return;
+      }
+      const local = readLocalComposer(sessionId);
+      const data = await api(`/api/composer?session_id=${encodeURIComponent(sessionId)}`);
+      if (state.sessionId !== sessionId) return;
+      const composer = data.composer || {};
+      state.composerVersion = Number(composer.version) || 0;
+      state.composerLoadedSessionId = sessionId;
+      const localUnsynced = Boolean(local && local.synced === false && local.text !== composer.text);
+      if (localUnsynced) {
+        $("messageInput").value = local.text;
+        state.composerDirty = true;
+        setComposerStatus("Recovered unsent text; saving...", "saving");
+        scheduleComposerSave(120);
+        return;
+      }
+      if (!state.composerDirty || options.force) {
+        $("messageInput").value = String(composer.text || "");
+        state.composerDirty = false;
+        persistLocalComposer($("messageInput").value, { serverVersion: state.composerVersion, synced: true });
+        setComposerStatus(composer.text ? "Draft synced" : "Draft saved", "saved");
+      }
+    }
 
     function profileLabel(profile) {
       const model = String(profile && profile.model || "").trim();
@@ -5732,6 +6201,7 @@ INDEX_HTML = r"""<!doctype html>
       state.busy = Boolean(label);
       $("busyLabel").textContent = label || "";
       for (const id of ["sendButton", "draftButton", "publishButton", "redraftButton", "attachAnyButton", "quotePreviousButton"]) $(id).disabled = state.busy;
+      $("micButton").disabled = state.busy || !state.speechSupported;
     }
 
     function setQueueStatus(queue) {
@@ -5774,6 +6244,45 @@ INDEX_HTML = r"""<!doctype html>
       return String(value).replace(/[&<>"']/g, (ch) => ({
         "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
       }[ch]));
+    }
+
+    function renderMarkdown(root, source) {
+      const markdown = String(source || "").trim();
+      if (!markdown) {
+        root.textContent = "";
+        return;
+      }
+      if (!window.marked || !window.DOMPurify) {
+        root.textContent = markdown;
+        return;
+      }
+      const rendered = window.marked.parse(markdown, { gfm: true, breaks: true });
+      root.innerHTML = window.DOMPurify.sanitize(rendered, {
+        USE_PROFILES: { html: true },
+        FORBID_TAGS: ["style", "script"],
+        FORBID_ATTR: ["style", "onerror", "onload"]
+      });
+      for (const link of root.querySelectorAll("a[href]")) {
+        const href = String(link.getAttribute("href") || "").trim();
+        if (/^(https?:|mailto:)/i.test(href)) {
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+        }
+      }
+      if (typeof window.renderMathInElement === "function") {
+        window.renderMathInElement(root, {
+          delimiters: [
+            { left: "$$", right: "$$", display: true },
+            { left: "\\[", right: "\\]", display: true },
+            { left: "\\(", right: "\\)", display: false },
+            { left: "$", right: "$", display: false }
+          ],
+          ignoredTags: ["script", "noscript", "style", "textarea", "pre", "code"],
+          throwOnError: false,
+          strict: "ignore",
+          trust: false
+        });
+      }
     }
 
     function stableJson(value) {
@@ -6219,6 +6728,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function clearChat() {
+      stopSpeechRecognition();
       state.sessionId = null;
       state.messagePage = null;
       state.visibleMessages = [];
@@ -6227,6 +6737,9 @@ INDEX_HTML = r"""<!doctype html>
       state.artifactItems = [];
       state.selectedArtifactId = "";
       state.artifactSignature = "";
+      state.composerVersion = 0;
+      state.composerDirty = false;
+      state.composerLoadedSessionId = "";
       renderArtifactBadge();
       renderArtifactList();
       clearComposerAttachments();
@@ -6239,6 +6752,7 @@ INDEX_HTML = r"""<!doctype html>
       $("publishLog").textContent = "No draft yet.";
       setQueueStatus(null);
       renderPostProjects([], "");
+      loadComposerDraft().catch(() => {});
       startEventStream();
     }
 
@@ -6567,6 +7081,114 @@ INDEX_HTML = r"""<!doctype html>
       $("attachmentInput").value = "";
     }
 
+    function setSpeechState(active, message = "") {
+      state.speechActive = active;
+      const button = $("micButton");
+      button.classList.toggle("listening", active);
+      button.setAttribute("aria-pressed", String(active));
+      button.setAttribute("aria-label", active ? "Stop voice input" : "Start voice input");
+      button.title = active ? "Stop voice input" : "Start voice input";
+      if (message) setComposerStatus(message, active ? "saving" : "error");
+    }
+
+    function speechTextWithInterim(interim = "") {
+      const spoken = `${state.speechFinalText}${interim}`.trim();
+      if (!spoken) return state.speechBaseText;
+      const separator = state.speechBaseText && !/\s$/.test(state.speechBaseText) ? " " : "";
+      return `${state.speechBaseText}${separator}${spoken}`;
+    }
+
+    function stopSpeechRecognition() {
+      state.speechKeepAlive = false;
+      if (state.speechRecognition && state.speechActive) {
+        try {
+          state.speechRecognition.stop();
+        } catch {}
+      }
+      setSpeechState(false);
+      if (state.composerDirty) scheduleComposerSave(80);
+    }
+
+    function startSpeechRecognition() {
+      if (!state.speechSupported || !state.speechRecognition) {
+        setComposerStatus("Voice input is not supported by this browser", "error");
+        return;
+      }
+      state.speechBaseText = $("messageInput").value;
+      state.speechFinalText = "";
+      state.speechKeepAlive = true;
+      try {
+        state.speechRecognition.start();
+      } catch (error) {
+        state.speechKeepAlive = false;
+        setSpeechState(false, error && error.message ? error.message : "Could not start voice input");
+      }
+    }
+
+    function initSpeechRecognition() {
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      state.speechSupported = Boolean(SpeechRecognition);
+      const button = $("micButton");
+      if (!SpeechRecognition) {
+        button.disabled = true;
+        button.title = "Voice input is not supported by this browser";
+        button.setAttribute("aria-label", button.title);
+        return;
+      }
+      const recognition = new SpeechRecognition();
+      recognition.lang = navigator.language || "en-US";
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.maxAlternatives = 1;
+      recognition.onstart = () => setSpeechState(true, "Listening...");
+      recognition.onresult = (event) => {
+        let interim = "";
+        for (let index = event.resultIndex; index < event.results.length; index += 1) {
+          const transcript = String(event.results[index][0] && event.results[index][0].transcript || "");
+          if (event.results[index].isFinal) {
+            state.speechFinalText += `${transcript.trim()} `;
+          } else {
+            interim += transcript;
+          }
+        }
+        $("messageInput").value = speechTextWithInterim(interim);
+        composerInputChanged();
+        setComposerStatus("Listening and saving...", "saving");
+      };
+      recognition.onerror = (event) => {
+        const code = String(event.error || "voice input error");
+        if (!["no-speech", "aborted"].includes(code)) {
+          state.speechKeepAlive = false;
+          setSpeechState(false, code === "not-allowed" ? "Microphone permission was not granted" : `Voice input: ${code}`);
+        }
+      };
+      recognition.onend = () => {
+        state.speechActive = false;
+        if (state.speechKeepAlive && !state.busy && !document.hidden) {
+          setTimeout(() => {
+            try {
+              recognition.start();
+            } catch {
+              state.speechKeepAlive = false;
+              setSpeechState(false, "Voice input stopped");
+            }
+          }, 180);
+          return;
+        }
+        setSpeechState(false);
+      };
+      state.speechRecognition = recognition;
+      button.disabled = false;
+    }
+
+    function toggleSpeechRecognition() {
+      if (state.speechActive || state.speechKeepAlive) {
+        stopSpeechRecognition();
+      } else {
+        startSpeechRecognition();
+      }
+    }
+
     function buildMessageAttachmentNode(attachment) {
       const item = document.createElement("div");
       item.className = "msg-attachment";
@@ -6755,7 +7377,7 @@ INDEX_HTML = r"""<!doctype html>
       body.className = "msg-body";
       const content = document.createElement("div");
       content.className = "msg-content";
-      content.textContent = (msg.content || "").trim();
+      renderMarkdown(content, msg.content || "");
       const actions = document.createElement("div");
       actions.className = "msg-actions";
       const quoteAction = document.createElement("button");
@@ -6899,8 +7521,14 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     async function loadSession(id) {
+      if (state.sessionId && state.sessionId !== id && state.composerDirty) {
+        await saveComposerDraft();
+      }
+      stopSpeechRecognition();
       const data = await api(`/api/session?id=${encodeURIComponent(id)}&limit=10`);
       renderSession(data);
+      state.composerDirty = false;
+      await loadComposerDraft({ force: true });
     }
 
     async function pollActiveSession() {
@@ -6930,6 +7558,7 @@ INDEX_HTML = r"""<!doctype html>
       if (pending.has("posts")) tasks.push(loadPostProjects());
       if (pending.has("jobs")) tasks.push(loadJobs());
       if (pending.has("artifacts")) tasks.push(loadArtifacts({ loadSelected: $("artifactModal").classList.contains("open") }));
+      if (pending.has("composer")) tasks.push(loadComposerDraft());
       await Promise.allSettled(tasks);
     }
 
@@ -6939,6 +7568,7 @@ INDEX_HTML = r"""<!doctype html>
         tasks.push(pollActiveSession());
         tasks.push(loadPostProjects());
         tasks.push(loadArtifacts({ loadSelected: $("artifactModal").classList.contains("open") }));
+        if (!state.composerDirty) tasks.push(loadComposerDraft());
       }
       await Promise.allSettled(tasks);
     }
@@ -7002,6 +7632,11 @@ INDEX_HTML = r"""<!doctype html>
       if (type === "posts_changed") queueRealtimeRefresh("posts");
       if (type === "jobs_changed") queueRealtimeRefresh("jobs");
       if (type === "artifacts_changed" && relevant) queueRealtimeRefresh("artifacts");
+      if (
+        type === "composer_updated"
+        && relevant
+        && String(payload.client_id || "") !== state.composerClientId
+      ) queueRealtimeRefresh("composer");
     }
 
     function startEventStream(force = false) {
@@ -7033,7 +7668,7 @@ INDEX_HTML = r"""<!doctype html>
       source.addEventListener("heartbeat", () => {
         state.eventConnected = true;
       });
-      for (const type of ["session_updated", "sessions_changed", "session_deleted", "posts_changed", "jobs_changed", "artifacts_changed"]) {
+      for (const type of ["session_updated", "sessions_changed", "session_deleted", "posts_changed", "jobs_changed", "artifacts_changed", "composer_updated"]) {
         source.addEventListener(type, (evt) => {
           try {
             handleRealtimeEvent(type, JSON.parse(evt.data || "{}"));
@@ -7156,7 +7791,6 @@ INDEX_HTML = r"""<!doctype html>
     async function sendMessage(event) {
       event.preventDefault();
       const rawMessage = $("messageInput").value.trim();
-      const replyTarget = state.replyTarget ? { ...state.replyTarget } : null;
       const message = composeChatMessage(rawMessage);
       const attachments = state.composerAttachments.map((item) => ({
         name: item.name,
@@ -7167,17 +7801,22 @@ INDEX_HTML = r"""<!doctype html>
         preview_url: item.preview_url
       }));
       if (!message && attachments.length === 0) return;
-      $("messageInput").value = "";
-      clearComposerAttachments();
-      clearReplyTarget();
+      stopSpeechRecognition();
       setBusy("queued chat message...");
       try {
+        if (rawMessage) await saveComposerDraft({ throwOnError: false });
         const data = await api("/api/chat", {
           session_id: state.sessionId,
           message,
           attachments
         });
         renderSession(data);
+        $("messageInput").value = "";
+        state.composerDirty = true;
+        persistLocalComposer("", { synced: false });
+        clearComposerAttachments();
+        clearReplyTarget();
+        await saveComposerDraft({ throwOnError: false });
         if (data.action_result && data.action_result.status === "executed") {
           if (data.action_result.action === "select_post") {
             const resolved = data.action_result.resolved_post || {};
@@ -7188,14 +7827,9 @@ INDEX_HTML = r"""<!doctype html>
         }
       } catch (err) {
         $("publishLog").textContent = err.message;
-        $("messageInput").value = rawMessage;
-        state.replyTarget = replyTarget;
-        renderReplyTarget();
-        state.composerAttachments = attachments.map((item, index) => ({
-          ...item,
-          id: `retry-${Date.now()}-${index}`
-        }));
-        renderAttachmentPreview();
+        state.composerDirty = true;
+        persistLocalComposer($("messageInput").value, { synced: false });
+        setComposerStatus("Message kept; retry when connected", "error");
       } finally {
         setBusy("");
       }
@@ -7259,9 +7893,11 @@ INDEX_HTML = r"""<!doctype html>
       if (state.busy) return;
       $("attachmentInput").click();
     });
+    $("micButton").addEventListener("click", toggleSpeechRecognition);
     $("quotePreviousButton").addEventListener("click", quotePreviousMessage);
     $("composerReplyClear").addEventListener("click", clearReplyTarget);
     $("attachmentInput").addEventListener("change", onAttachmentsSelected);
+    $("messageInput").addEventListener("input", composerInputChanged);
     $("messageInput").addEventListener("keydown", (event) => {
       if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
         event.preventDefault();
@@ -7400,6 +8036,8 @@ INDEX_HTML = r"""<!doctype html>
         navigator.serviceWorker.register("/service-worker.js").catch(() => {});
       });
     }
+    initSpeechRecognition();
+    loadComposerDraft().catch(() => {});
     loadSettings().catch((err) => { $("settingsLog").textContent = err.message; });
     loadSessions({ autoload: true }).catch((err) => { $("publishLog").textContent = err.message; });
     loadPostProjects().catch(() => {});
@@ -7409,10 +8047,27 @@ INDEX_HTML = r"""<!doctype html>
     scheduleSafetySync(90000);
     window.addEventListener("online", () => {
       startEventStream(true);
+      if (state.composerDirty) scheduleComposerSave(80);
       runSafetySync().catch(() => {});
+    });
+    window.addEventListener("pagehide", () => {
+      const text = $("messageInput").value;
+      persistLocalComposer(text, { synced: !state.composerDirty });
+      if (!state.sessionId || !state.composerDirty || !navigator.sendBeacon) return;
+      const body = new Blob([JSON.stringify({
+        session_id: state.sessionId,
+        text,
+        client_id: state.composerClientId,
+        base_version: state.composerVersion
+      })], { type: "application/json" });
+      navigator.sendBeacon("/api/composer", body);
     });
     document.addEventListener("visibilitychange", () => {
       scheduleSafetySync(document.hidden ? 300000 : 1000);
+      if (document.hidden) {
+        stopSpeechRecognition();
+        if (state.composerDirty) saveComposerDraft().catch(() => {});
+      }
       if (!document.hidden) {
         startEventStream(true);
         runSafetySync().catch(() => {});
@@ -7442,10 +8097,7 @@ LOGIN_HTML = r"""<!doctype html>
       place-items: center;
       color: var(--ink);
       font-family: "Newsreader", Georgia, serif;
-      background:
-        radial-gradient(circle at 18% 18%, rgba(227, 169, 47, 0.34), transparent 26rem),
-        radial-gradient(circle at 82% 14%, rgba(15, 118, 110, 0.2), transparent 24rem),
-        linear-gradient(135deg, #fffaf0 0%, #f3ead7 52%, #d9ede8 100%);
+      background: #edf8f4;
       padding: 24px;
     }
     .card {
@@ -7457,12 +8109,12 @@ LOGIN_HTML = r"""<!doctype html>
       box-shadow: 0 24px 70px rgba(28, 45, 38, 0.16);
       backdrop-filter: blur(18px);
     }
-    h1 { font-family: "Fraunces", Georgia, serif; font-size: 42px; line-height: 0.95; letter-spacing: -0.05em; margin: 0; }
+    h1 { font-family: "Fraunces", Georgia, serif; font-size: 42px; line-height: 1; letter-spacing: 0; margin: 0; }
     p { color: var(--muted); line-height: 1.5; }
     label { display: block; font-size: 13px; color: var(--muted); margin: 16px 0 6px 4px; }
     input { width: 100%; border: 1px solid rgba(39, 55, 46, 0.18); border-radius: 18px; background: rgba(255, 255, 255, 0.7); padding: 12px 14px; font: inherit; outline: none; }
     input:focus { border-color: rgba(15, 118, 110, 0.55); box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.12); }
-    button { width: 100%; margin-top: 20px; border: 0; border-radius: 999px; padding: 13px 18px; background: linear-gradient(135deg, var(--clay), var(--gold)); color: #231b12; font: inherit; font-weight: 600; cursor: pointer; }
+    button { width: 100%; margin-top: 20px; border: 0; border-radius: 999px; padding: 13px 18px; background: var(--gold); color: #231b12; font: inherit; font-weight: 700; cursor: pointer; }
     .error { margin-top: 14px; color: #8a2b12; min-height: 1.4em; }
     .hint { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color: var(--teal); overflow-wrap: anywhere; }
   </style>
@@ -7512,8 +8164,8 @@ PWA_MANIFEST = {
     "scope": "/",
     "display": "standalone",
     "display_override": ["window-controls-overlay", "standalone", "browser"],
-    "background_color": "#fffaf0",
-    "theme_color": "#0f766e",
+    "background_color": "#edf8f4",
+    "theme_color": "#16a394",
     "orientation": "any",
     "categories": ["productivity", "writing", "utilities"],
     "icons": [
@@ -7548,8 +8200,18 @@ PWA_MANIFEST = {
 }
 
 
-SERVICE_WORKER = r"""const CACHE_NAME = "lazyblog-studio-v5";
-const APP_SHELL = ["/manifest.webmanifest", "/icons/lazyblog.svg", "/icons/lazyblog-192.png", "/icons/lazyblog-512.png"];
+SERVICE_WORKER = r"""const CACHE_NAME = "lazyblog-studio-v6";
+const APP_SHELL = [
+  "/manifest.webmanifest",
+  "/icons/lazyblog.svg",
+  "/icons/lazyblog-192.png",
+  "/icons/lazyblog-512.png",
+  "/assets/vendor/marked.js",
+  "/assets/vendor/dompurify.js",
+  "/assets/vendor/katex.js",
+  "/assets/vendor/katex-auto-render.js",
+  "/assets/vendor/katex.css"
+];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL)));
@@ -7649,6 +8311,7 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "LazyBlogStudio/0.1"
+        sys_version = ""
 
         def log_message(self, fmt: str, *args: Any) -> None:
             sys.stderr.write("%s - - [%s] %s\n" % (self.address_string(), self.log_date_time_string(), fmt % args))
@@ -7822,8 +8485,22 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
                 if parsed.path == "/icons/lazyblog-512.png":
                     self.send_bytes(make_icon_png(512), "image/png")
                     return
+                if parsed.path in VENDOR_ASSETS:
+                    filename, content_type = VENDOR_ASSETS[parsed.path]
+                    self.send_bytes((VENDOR_ROOT / filename).read_bytes(), content_type)
+                    return
+                if parsed.path == "/assets/vendor/katex-font":
+                    params = urllib.parse.parse_qs(parsed.query)
+                    font_name = params.get("name", [""])[0]
+                    if not re.fullmatch(r"KaTeX_[A-Za-z0-9-]+\.woff2", font_name):
+                        raise WebAppError("invalid KaTeX font name")
+                    font_path = VENDOR_ROOT / "katex-fonts" / font_name
+                    if not font_path.is_file():
+                        raise WebAppError("unknown KaTeX font")
+                    self.send_bytes(font_path.read_bytes(), "font/woff2")
+                    return
                 if parsed.path == "/api/health":
-                    self.send_json({"status": "ok", "root": str(ROOT_DIR)})
+                    self.send_json({"status": "ok"})
                     return
                 if parsed.path == "/api/events":
                     self.send_event_stream(parsed)
@@ -7840,6 +8517,11 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
                     raw_limit = params.get("limit", [str(DEFAULT_MESSAGE_BATCH_SIZE)])[0]
                     before = params.get("before", [""])[0]
                     self.send_json(app.session_payload(session_id, limit=int(raw_limit), before=before))
+                    return
+                if parsed.path == "/api/composer":
+                    params = urllib.parse.parse_qs(parsed.query)
+                    session_id = params.get("session_id", [""])[0]
+                    self.send_json({"composer": app.composer_payload(session_id)})
                     return
                 if parsed.path == "/api/messages":
                     params = urllib.parse.parse_qs(parsed.query)
@@ -7939,6 +8621,16 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
                     return
                 if parsed.path == "/api/settings":
                     self.send_json({"settings": app.save_model_settings(payload)})
+                    return
+                if parsed.path == "/api/composer":
+                    self.send_json(
+                        app.save_composer(
+                            str(payload.get("text", "")),
+                            payload.get("session_id") or None,
+                            client_id=str(payload.get("client_id", "")),
+                            base_version=int(payload.get("base_version") or 0),
+                        )
+                    )
                     return
                 if parsed.path == "/api/session/rename":
                     self.send_json(app.rename_session(str(payload.get("session_id", "")), str(payload.get("title", ""))))
