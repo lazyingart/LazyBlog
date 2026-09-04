@@ -114,6 +114,21 @@ class WebAppError(RuntimeError):
     pass
 
 
+class PromptRouteError(WebAppError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        attempts: list[dict[str, Any]] | None = None,
+        stdout: str = "",
+        stderr: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.attempts = attempts or []
+        self.stdout = stdout
+        self.stderr = stderr
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
@@ -3496,7 +3511,13 @@ Rules:
                     check=False,
                 )
             except subprocess.TimeoutExpired:
-                raise WebAppError("Codex route timed out; the prompt was not replayed on another provider")
+                attempts.append({**route, "status": "timed_out", "returncode": None})
+                raise PromptRouteError(
+                    "Codex route timed out; the prompt was not replayed on another provider",
+                    attempts=attempts,
+                    stdout="\n".join(stdout_parts),
+                    stderr="\n".join(stderr_parts),
+                )
             stdout_parts.append(proc.stdout or "")
             stderr_parts.append(proc.stderr or "")
             valid_output = False
@@ -3561,7 +3582,19 @@ Rules:
                         check=False,
                     )
                 except subprocess.TimeoutExpired:
-                    raise WebAppError("AgInTi DeepSeek fallback timed out")
+                    route = {
+                        "provider": "aginti-deepseek",
+                        "account": "",
+                        "model": deepseek_model,
+                        "reasoning": "provider-default",
+                    }
+                    attempts.append({**route, "status": "timed_out", "returncode": None})
+                    raise PromptRouteError(
+                        "AgInTi DeepSeek fallback timed out",
+                        attempts=attempts,
+                        stdout="\n".join(stdout_parts),
+                        stderr="\n".join(stderr_parts),
+                    )
                 stdout_parts.append(proc.stdout or "")
                 stderr_parts.append(proc.stderr or "")
                 valid_output = False
@@ -3596,7 +3629,12 @@ Rules:
                         "stderr": "\n".join(stderr_parts),
                     }
 
-        raise WebAppError("all configured Codex and AgInTi DeepSeek routes failed")
+        raise PromptRouteError(
+            "all configured Codex and AgInTi DeepSeek routes failed",
+            attempts=attempts,
+            stdout="\n".join(stdout_parts),
+            stderr="\n".join(stderr_parts),
+        )
 
     def profile_for_tool(self, tool_name: str, schema_name: str = "") -> dict[str, str]:
         if schema_name == "translation":
@@ -3831,6 +3869,21 @@ Rules:
                 except Exception:
                     pass
             self.update_job(job_id, updates)
+        except PromptRouteError as exc:
+            (job_dir / "stdout.log").write_text(exc.stdout, encoding="utf-8")
+            (job_dir / "stderr.log").write_text(exc.stderr, encoding="utf-8")
+            self.update_job(
+                job_id,
+                {
+                    "status": "failed",
+                    "finished_at": now_iso(),
+                    "elapsed_seconds": round(time.time() - started, 2),
+                    "returncode": 1,
+                    "route": None,
+                    "attempts": exc.attempts,
+                    "error": str(exc),
+                },
+            )
         except Exception as exc:  # noqa: BLE001
             (job_dir / "stderr.log").write_text(traceback.format_exc(), encoding="utf-8")
             self.update_job(

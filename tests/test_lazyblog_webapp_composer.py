@@ -6,6 +6,7 @@ import threading
 import unittest
 from collections import deque
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -68,6 +69,7 @@ class ComposerDraftTests(unittest.TestCase):
 class PromptRouteTests(unittest.TestCase):
     def setUp(self) -> None:
         self.app = lazyblog_webapp.LazyBlogStudio.__new__(lazyblog_webapp.LazyBlogStudio)
+        self.app.args = SimpleNamespace(codex_timeout=60)
 
     @patch.object(lazyblog_webapp.shutil, "which", return_value="/usr/local/bin/agent-run")
     @patch.dict(
@@ -100,6 +102,29 @@ class PromptRouteTests(unittest.TestCase):
         routes = self.app.structured_prompt_routes("gpt-5.6-sol", "low")
 
         self.assertTrue(all(row["account"] == "" for row in routes))
+
+    @patch.object(lazyblog_webapp.shutil, "which", return_value=None)
+    @patch.object(lazyblog_webapp.subprocess, "run")
+    @patch.dict(lazyblog_webapp.os.environ, {"LAZYBLOG_CODEX_FALLBACK_MODEL": ""}, clear=False)
+    def test_failed_routes_preserve_attempt_metadata(self, run, _which) -> None:
+        run.return_value = SimpleNamespace(returncode=1, stdout="provider stdout", stderr="provider stderr")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "output.json"
+            schema_path = Path(temp_dir) / "schema.json"
+            schema_path.write_text('{"type":"object"}', encoding="utf-8")
+            with self.assertRaises(lazyblog_webapp.PromptRouteError) as raised:
+                self.app.run_structured_prompt(
+                    full_prompt="test",
+                    schema_path=schema_path,
+                    output_path=output_path,
+                    model="gpt-5.6-sol",
+                    reasoning="low",
+                    allow_aginti=False,
+                )
+
+        self.assertEqual(raised.exception.attempts[0]["status"], "failed")
+        self.assertEqual(raised.exception.attempts[0]["model"], "gpt-5.6-sol")
+        self.assertIn("provider stderr", raised.exception.stderr)
 
 
 class StudioDefaultsTests(unittest.TestCase):
