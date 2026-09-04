@@ -31,6 +31,8 @@ content/chat/<session-id>/
   session.json
   messages/*.md
 
+content/lazyblog-studio.sqlite3
+
 content/studio-posts/<post-project-id>/
   post.json
   drafts/<revision>.md
@@ -38,6 +40,14 @@ content/studio-posts/<post-project-id>/
 
 content/taxonomy/categories.json
 ```
+
+Message Markdown is the inspectable operational source. SQLite mirrors the
+current record in `messages` and keeps append-only snapshots in
+`message_events`, including edits, processing transitions, unsends, and session
+deletions. Writes are atomic, SQLite uses WAL with full synchronization, and
+startup reconciliation imports missing Markdown rows idempotently. The database
+and Markdown chat directory are private runtime state and must remain ignored by
+git.
 
 `post.json` should include:
 
@@ -80,8 +90,16 @@ Legacy `/api/draft` and `/api/publish` still exist for compatibility, but the St
 
 ## Prompt Tools
 
-- `web-action-router.txt` runs on `gpt-5.3-codex-spark` with medium reasoning. It classifies chat messages into one bounded action: `select_post`, `create_category`, `sync_categories`, or `no_op`.
+- The fast chat lane uses `gpt-5.6-sol` with low reasoning. Ordinary notes skip the action-model call when deterministic checks find no control instruction.
+- The deep task lane uses `gpt-5.6-sol` with high reasoning for drafting, revision, research, and publish preparation.
+- `web-action-router.txt` uses `gpt-5.6-sol` with medium reasoning only for likely control instructions. It classifies chat messages into one bounded action; `gpt-5.3-codex-spark` remains a configured fallback.
 - `web-git-commit-push.txt` also uses `gpt-5.3-codex-spark` medium through `codex exec`. The backend generates an allowlisted shell script with exact paths, then Codex runs only that script. This keeps commit/push deterministic while still using the Codex prompt tool.
+
+Studio invokes prompt wrappers with `codex exec --ephemeral` and supplies the
+stored transcript and managed object state explicitly. It does not rely on a
+resumed hidden Codex thread as application memory. This keeps account fallback,
+post selection, and create-versus-update behavior reproducible; a future thread
+cache may optimize replies, but Markdown and SQLite remain authoritative.
 
 If a chat message contains a blog/WordPress post URL, the action router selects the post object before the reply tool answers. The publish panel then shows the linked `PostProject` and its local mirror path so the next chat/draft action edits the selected object.
 

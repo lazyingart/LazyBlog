@@ -13,6 +13,7 @@ import mimetypes
 import os
 import re
 import shutil
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -47,6 +48,7 @@ TAXONOMY_ROOT = ROOT_DIR / "content" / "taxonomy"
 CATEGORY_SNAPSHOT_PATH = TAXONOMY_ROOT / "categories.json"
 POST_PROJECT_ROOT = ROOT_DIR / "content" / "studio-posts"
 STUDIO_SETTINGS_PATH = ROOT_DIR / "content" / "studio-settings.json"
+MESSAGE_STORE_FILENAME = "lazyblog-studio.sqlite3"
 VENDOR_ROOT = ROOT_DIR / "web" / "vendor"
 VENDOR_ASSETS = {
     "/assets/vendor/marked.js": ("marked-15.0.12.min.js", "application/javascript; charset=utf-8"),
@@ -102,10 +104,10 @@ ARTIFACT_SECRET_MARKERS = {
 }
 DEFAULT_PROFILE_SETTINGS = {
     "reply": {"model": "gpt-5.6-sol", "reasoning": "low"},
-    "task": {"model": "gpt-5.6-sol", "reasoning": "low"},
-    "action": {"model": "gpt-5.6-sol", "reasoning": "low"},
-    "response": {"model": "gpt-5.6-sol", "reasoning": "low"},
-    "translation": {"model": "gpt-5.6-sol", "reasoning": "low"},
+    "task": {"model": "gpt-5.6-sol", "reasoning": "high"},
+    "action": {"model": "gpt-5.6-sol", "reasoning": "medium"},
+    "response": {"model": "gpt-5.6-sol", "reasoning": "medium"},
+    "translation": {"model": "gpt-5.6-sol", "reasoning": "medium"},
 }
 REASONING_LEVELS = {"low", "medium", "high", "xhigh"}
 STUDIO_AUTH_COOKIE = "lazyblog_studio_auth"
@@ -341,7 +343,16 @@ def write_markdown(path: Path, front_matter: dict[str, Any], body: str) -> None:
         else:
             lines.append(f"{key}: {yaml_quote(value)}")
     lines.append("---")
-    path.write_text("\n".join(lines) + "\n\n" + body.strip() + "\n", encoding="utf-8")
+    payload = "\n".join(lines) + "\n\n" + body.strip() + "\n"
+    tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp_path.replace(path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def read_json(path: Path, default: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -690,18 +701,204 @@ class LazyBlogStudio:
         self.chat_queue_lock = threading.Lock()
         self.composer_lock = threading.Lock()
         self.message_lock = threading.Lock()
+        self.message_store_lock = threading.RLock()
         self.audio_job_lock = threading.Lock()
         self.chat_queue_event = threading.Event()
         self.audio_job_event = threading.Event()
         self.event_lock = threading.Condition()
         self.event_seq = 0
         self.events: deque[dict[str, Any]] = deque(maxlen=500)
+        self.initialize_message_store()
         self.reset_stale_chat_queue_items()
         self.reset_stale_audio_jobs()
         self.chat_queue_thread = threading.Thread(target=self.chat_queue_loop, daemon=True)
         self.chat_queue_thread.start()
         self.audio_job_thread = threading.Thread(target=self.audio_job_loop, daemon=True)
         self.audio_job_thread.start()
+
+    def message_store_path(self) -> Path:
+        return ROOT_DIR / "content" / MESSAGE_STORE_FILENAME
+
+    def message_store_connection(self) -> sqlite3.Connection:
+        path = self.message_store_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(path, timeout=15)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 15000")
+        connection.execute("PRAGMA synchronous = FULL")
+        return connection
+
+    def initialize_message_store(self) -> None:
+        if not hasattr(self, "message_store_lock"):
+            self.message_store_lock = threading.RLock()
+        path = self.message_store_path()
+        with self.message_store_lock:
+            if getattr(self, "_message_store_ready", "") == str(path):
+                return
+            with self.message_store_connection() as connection:
+                connection.execute("PRAGMA journal_mode = WAL")
+                connection.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS messages (
+                        message_id TEXT PRIMARY KEY,
+                        session_id TEXT NOT NULL,
+                        role TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        metadata_json TEXT NOT NULL,
+                        relative_path TEXT NOT NULL UNIQUE,
+                        content_sha256 TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        deleted_at TEXT
+                    );
+                    CREATE INDEX IF NOT EXISTS messages_session_created_idx
+                        ON messages(session_id, created_at);
+                    CREATE TABLE IF NOT EXISTS message_events (
+                        event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        message_id TEXT NOT NULL,
+                        session_id TEXT NOT NULL,
+                        event_type TEXT NOT NULL,
+                        snapshot_json TEXT NOT NULL,
+                        content_sha256 TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS message_events_message_idx
+                        ON message_events(message_id, event_id);
+                    CREATE INDEX IF NOT EXISTS message_events_session_idx
+                        ON message_events(session_id, event_id);
+                    """
+                )
+            self._message_store_ready = str(path)
+
+        for message_path in CHAT_ROOT.glob("*/messages/*.md"):
+            try:
+                self.store_message_record(message_path, "reconciled")
+            except Exception:
+                traceback.print_exc()
+
+    def store_message_record(self, path: Path, event_type: str) -> None:
+        self.initialize_message_store()
+        resolved = path.resolve()
+        if not resolved.is_file() or resolved.parent.name != "messages" or CHAT_ROOT.resolve() not in resolved.parents:
+            raise WebAppError("message ledger only accepts active chat messages")
+        text = resolved.read_text(encoding="utf-8")
+        front_matter, body = split_front_matter(text)
+        session_id = safe_session_id(str(front_matter.get("session_id") or resolved.parent.parent.name))
+        role = str(front_matter.get("role") or resolved.stem.rsplit("-", 1)[-1])
+        metadata_json = json.dumps(front_matter, ensure_ascii=False, sort_keys=True)
+        fingerprint = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        created_at = str(front_matter.get("created_at") or now_iso())
+        updated_at = now_iso()
+        relative_path = str(resolved.relative_to(ROOT_DIR.resolve()))
+        snapshot_json = json.dumps(
+            {"content": body.strip(), "front_matter": front_matter, "relative_path": relative_path},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        with self.message_store_lock, self.message_store_connection() as connection:
+            previous = connection.execute(
+                "SELECT content_sha256, deleted_at FROM messages WHERE message_id = ?",
+                (resolved.stem,),
+            ).fetchone()
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO messages (
+                    message_id, session_id, role, content, metadata_json, relative_path,
+                    content_sha256, created_at, updated_at, deleted_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                ON CONFLICT(message_id) DO UPDATE SET
+                    session_id = excluded.session_id,
+                    role = excluded.role,
+                    content = excluded.content,
+                    metadata_json = excluded.metadata_json,
+                    relative_path = excluded.relative_path,
+                    content_sha256 = excluded.content_sha256,
+                    updated_at = excluded.updated_at,
+                    deleted_at = NULL
+                """,
+                (
+                    resolved.stem,
+                    session_id,
+                    role,
+                    body.strip(),
+                    metadata_json,
+                    relative_path,
+                    fingerprint,
+                    created_at,
+                    updated_at,
+                ),
+            )
+            if previous is None or previous["content_sha256"] != fingerprint or previous["deleted_at"]:
+                connection.execute(
+                    """
+                    INSERT INTO message_events (
+                        message_id, session_id, event_type, snapshot_json, content_sha256, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (resolved.stem, session_id, event_type, snapshot_json, fingerprint, updated_at),
+                )
+
+    def write_message_record(
+        self,
+        path: Path,
+        front_matter: dict[str, Any],
+        body: str,
+        event_type: str,
+    ) -> None:
+        self.initialize_message_store()
+        write_markdown(path, front_matter, body)
+        self.store_message_record(path, event_type)
+
+    def mark_message_deleted(self, path: Path, event_type: str = "unsent") -> None:
+        self.store_message_record(path, "pre_delete_snapshot")
+        front_matter, body = split_front_matter(path.read_text(encoding="utf-8"))
+        message_id = path.stem
+        session_id = safe_session_id(str(front_matter.get("session_id") or path.parent.parent.name))
+        deleted_at = now_iso()
+        snapshot_json = json.dumps(
+            {
+                "content": body.strip(),
+                "front_matter": front_matter,
+                "relative_path": str(path.resolve().relative_to(ROOT_DIR.resolve())),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        fingerprint = hashlib.sha256(path.read_bytes()).hexdigest()
+        with self.message_store_lock, self.message_store_connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "UPDATE messages SET deleted_at = ?, updated_at = ? WHERE message_id = ?",
+                (deleted_at, deleted_at, message_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO message_events (
+                    message_id, session_id, event_type, snapshot_json, content_sha256, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (message_id, session_id, event_type, snapshot_json, fingerprint, deleted_at),
+            )
+
+    def message_store_status(self, session_id: str = "") -> dict[str, Any]:
+        self.initialize_message_store()
+        where = " WHERE session_id = ?" if session_id else ""
+        params: tuple[str, ...] = (safe_session_id(session_id),) if session_id else ()
+        with self.message_store_lock, self.message_store_connection() as connection:
+            current = connection.execute(
+                f"SELECT COUNT(*) AS total, SUM(CASE WHEN deleted_at IS NULL THEN 1 ELSE 0 END) AS active FROM messages{where}",
+                params,
+            ).fetchone()
+            events = connection.execute(f"SELECT COUNT(*) AS total FROM message_events{where}", params).fetchone()
+        return {
+            "backend": "sqlite-wal",
+            "markdown_mirror": True,
+            "database_path": str(self.message_store_path().relative_to(ROOT_DIR)),
+            "messages": int(current["total"] or 0),
+            "active_messages": int(current["active"] or 0),
+            "events": int(events["total"] or 0),
+        }
 
     def new_session_id(self) -> str:
         return f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
@@ -1506,6 +1703,8 @@ Rules:
         trash_dir = CHAT_ROOT / ".trash"
         trash_dir.mkdir(parents=True, exist_ok=True)
         target = trash_dir / f"{stamp()}-{safe_id}"
+        for message_path in self.message_paths(safe_id):
+            self.mark_message_deleted(message_path, "session_deleted")
         session_dir.rename(target)
         self.emit_event("session_deleted", safe_id, {"session_id": safe_id})
         self.emit_event("sessions_changed", "", {"session_id": safe_id})
@@ -1523,7 +1722,7 @@ Rules:
         }
         if extra:
             front_matter.update(extra)
-        write_markdown(path, front_matter, content)
+        self.write_message_record(path, front_matter, content, "created")
         meta["message_count"] = int(meta.get("message_count", 0)) + 1
         if role == "user" and meta.get("title") in {"Untitled chat", ""}:
             title_candidate = content.strip().splitlines()[0][:80] if content.strip() else ""
@@ -1898,7 +2097,7 @@ Rules:
             }
         )
         with self.message_lock:
-            write_markdown(message_path, front_matter, message_text)
+            self.write_message_record(message_path, front_matter, message_text, "audio_transcribed")
         queue_item = {
             "id": queue_id,
             "session_id": str(job["session_id"]),
@@ -1944,7 +2143,7 @@ Rules:
             front_matter["queue_status"] = "failed"
             front_matter["error"] = error[:500]
             with self.message_lock:
-                write_markdown(message_path, front_matter, body)
+                self.write_message_record(message_path, front_matter, body, "audio_failed")
         self.update_audio_job(
             job,
             status="failed",
@@ -2639,7 +2838,7 @@ Rules:
         text = message_path.read_text(encoding="utf-8")
         front_matter, body = split_front_matter(text)
         front_matter["queue_status"] = status
-        write_markdown(message_path, front_matter, body)
+        self.write_message_record(message_path, front_matter, body, f"queue_{status}")
 
     def analyze_message_attachments(self, message_path: Path, session_id: str, queue_id: str) -> None:
         text = message_path.read_text(encoding="utf-8")
@@ -2651,14 +2850,14 @@ Rules:
         self.register_attachment_artifacts(session_id, queue_id, normalized)
         front_matter["attachments_json"] = json.dumps(normalized, ensure_ascii=False)
         front_matter["queue_status"] = "running"
-        write_markdown(message_path, front_matter, body)
+        self.write_message_record(message_path, front_matter, body, "attachments_analyzed")
 
     def edit_message(self, session_id: str, message_id: str, content: str) -> dict[str, Any]:
         safe_session = safe_session_id(session_id)
         path = self.message_file(safe_session, message_id)
         front_matter, _body = split_front_matter(path.read_text(encoding="utf-8"))
         front_matter["edited_at"] = now_iso()
-        write_markdown(path, front_matter, str(content or "").strip())
+        self.write_message_record(path, front_matter, str(content or "").strip(), "edited")
         meta = self.load_session(safe_session)
         self.save_session(safe_session, meta)
         return self.session_payload(safe_session)
@@ -2690,6 +2889,7 @@ Rules:
                     pass
         trash_dir = self.session_dir(safe_session) / "messages" / ".trash"
         trash_dir.mkdir(parents=True, exist_ok=True)
+        self.mark_message_deleted(path)
         path.rename(trash_dir / f"{stamp()}-{path.name}")
         meta = self.load_session(safe_session)
         meta["message_count"] = len(self.message_paths(safe_session))
@@ -4592,9 +4792,42 @@ Rules:
         }
 
     def route_chat_action(self, session_id: str, message: str) -> dict[str, Any]:
-        deterministic_hint = self.deterministic_action_hint(message)
         explicit_request = self.is_control_action_request(message)
         inferred_target_mode = self.infer_post_target_mode(message)
+        detected_reference = self.extract_post_reference_from_message(message)
+        if not explicit_request and not detected_reference:
+            return {
+                "action": "no_op",
+                "post_reference": "",
+                "post_target_mode": "",
+                "clarification_question": "",
+                "category": "",
+                "parent_category": "",
+                "sync_mode": "",
+                "status": "",
+                "force_redraft": False,
+                "instruction": message,
+                "reason": "No control instruction detected; used the fast chat lane without an action-model call.",
+                "confidence": 0.0,
+                "routing_lane": "fast-chat",
+            }
+        deterministic_hint = self.deterministic_action_hint(message)
+        if not explicit_request and deterministic_hint.get("action") != "select_post":
+            return {
+                "action": "no_op",
+                "post_reference": "",
+                "post_target_mode": "",
+                "clarification_question": "",
+                "category": "",
+                "parent_category": "",
+                "sync_mode": "",
+                "status": "",
+                "force_redraft": False,
+                "instruction": message,
+                "reason": "No control instruction detected; used the fast chat lane without an action-model call.",
+                "confidence": 0.0,
+                "routing_lane": "fast-chat",
+            }
         action_profile = self.codex_profile("action")
         payload = {
             "session": self.load_session(session_id),
@@ -4662,6 +4895,7 @@ Rules:
             routed.update({**deterministic_hint, "confidence": max(float(deterministic_hint.get("confidence") or 0), 0.74)})
         if routed.get("action") == "select_post" and deterministic_hint.get("action") == "update_post_categories":
             routed.update({**deterministic_hint, "confidence": max(float(deterministic_hint.get("confidence") or 0), 0.82)})
+        routed["routing_lane"] = "controlled-action"
         return routed
 
     def is_control_action_request(self, message: str) -> bool:
@@ -4685,6 +4919,12 @@ Rules:
             "no need to",
             "not need to publish",
             "not asking to",
+            "do not draft",
+            "do not publish",
+            "don't draft",
+            "don't publish",
+            "do not create a post",
+            "don't create a post",
             "只是在思考",
             "先不用發",
             "先不要發",
@@ -4742,6 +4982,17 @@ Rules:
             "update markdown",
             "polish this",
             "finish draft",
+            "set category",
+            "change category",
+            "replace category",
+            "sync categories",
+            "refresh categories",
+            "设置分类",
+            "設置分類",
+            "更改分类",
+            "更改分類",
+            "同步分类",
+            "同步分類",
         ]
         if any(marker in lowered for marker in explicit_commands):
             return True
@@ -5792,6 +6043,7 @@ Rules:
             "draft": draft,
             "active_post_project": active_post,
             "chat_queue": self.chat_queue_summary(session_id),
+            "message_store": self.message_store_status(session_id),
         }
 
 
@@ -6388,16 +6640,16 @@ INDEX_HTML = r"""<!doctype html>
       <p class="session-modal-title">Configure the model and reasoning used by the Studio.</p>
       <div class="settings-grid">
         <div class="settings-card">
-          <strong>Chat Reply</strong>
-          <p class="sub">Normal chat replies in the Studio.</p>
+          <strong>Fast Chat Lane</strong>
+          <p class="sub">Normal messages and captured notes.</p>
           <div class="settings-row">
             <input id="settingsReplyModel" placeholder="gpt-5.6-sol">
             <select id="settingsReplyReasoning"><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option></select>
           </div>
         </div>
         <div class="settings-card">
-          <strong>Write Assistant</strong>
-          <p class="sub">Drafting and revising posts from chat context.</p>
+          <strong>Deep Task Lane</strong>
+          <p class="sub">Drafting, revising, research, and publish preparation.</p>
           <div class="settings-row">
             <input id="settingsTaskModel" placeholder="gpt-5.6-sol">
             <select id="settingsTaskReasoning"><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option></select>
@@ -7251,7 +7503,10 @@ INDEX_HTML = r"""<!doctype html>
         applySettingsToForm(state.settings);
       }
       updateModelLabel();
-      $("settingsLog").textContent = "Loaded current model settings.";
+      const store = data.message_store || {};
+      $("settingsLog").textContent = store.backend
+        ? `Memory: ${store.active_messages || 0} active messages · ${store.events || 0} durable events · Markdown + SQLite WAL.`
+        : "Loaded current model settings.";
     }
 
     function collectSettingsPayload() {
@@ -7272,7 +7527,10 @@ INDEX_HTML = r"""<!doctype html>
         applySettingsToForm(state.settings);
       }
       updateModelLabel();
-      $("settingsLog").textContent = "Settings saved. New jobs will use these profiles.";
+      const store = data.message_store || {};
+      $("settingsLog").textContent = store.backend
+        ? `Settings saved · ${store.active_messages || 0} active messages protected by Markdown + SQLite WAL.`
+        : "Settings saved. New jobs will use these profiles.";
     }
 
     function clearChat() {
@@ -9389,7 +9647,13 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
                     self.send_event_stream(parsed)
                     return
                 if parsed.path == "/api/settings":
-                    self.send_json({"settings": app.load_model_settings()})
+                    self.send_json(
+                        {
+                            "settings": app.load_model_settings(),
+                            "message_store": app.message_store_status(),
+                            "session_strategy": "ephemeral-explicit-context",
+                        }
+                    )
                     return
                 if parsed.path == "/api/sessions":
                     self.send_json({"sessions": app.list_sessions()})
@@ -9521,7 +9785,13 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
                 if not self.authorize_request(parsed.path):
                     return
                 if parsed.path == "/api/settings":
-                    self.send_json({"settings": app.save_model_settings(payload)})
+                    self.send_json(
+                        {
+                            "settings": app.save_model_settings(payload),
+                            "message_store": app.message_store_status(),
+                            "session_strategy": "ephemeral-explicit-context",
+                        }
+                    )
                     return
                 if parsed.path == "/api/composer":
                     self.send_json(

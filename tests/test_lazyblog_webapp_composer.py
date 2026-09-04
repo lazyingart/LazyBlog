@@ -128,11 +128,10 @@ class PromptRouteTests(unittest.TestCase):
 
 
 class StudioDefaultsTests(unittest.TestCase):
-    def test_every_prompt_profile_defaults_to_sol_low(self) -> None:
-        self.assertEqual(
-            set((row["model"], row["reasoning"]) for row in lazyblog_webapp.DEFAULT_PROFILE_SETTINGS.values()),
-            {("gpt-5.6-sol", "low")},
-        )
+    def test_prompt_profiles_separate_fast_chat_and_deep_tasks(self) -> None:
+        self.assertEqual(lazyblog_webapp.DEFAULT_PROFILE_SETTINGS["reply"], {"model": "gpt-5.6-sol", "reasoning": "low"})
+        self.assertEqual(lazyblog_webapp.DEFAULT_PROFILE_SETTINGS["task"], {"model": "gpt-5.6-sol", "reasoning": "high"})
+        self.assertEqual(lazyblog_webapp.DEFAULT_PROFILE_SETTINGS["action"], {"model": "gpt-5.6-sol", "reasoning": "medium"})
 
     def test_vendored_rendering_assets_exist(self) -> None:
         for filename, _content_type in lazyblog_webapp.VENDOR_ASSETS.values():
