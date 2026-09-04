@@ -142,6 +142,42 @@ def studio_auth_enabled() -> bool:
     return bool(studio_login_token()) and not bool_env("LAZYBLOG_STUDIO_AUTH_DISABLED", False)
 
 
+def studio_cookie_only_auth_enabled() -> bool:
+    return bool_env("LAZYBLOG_STUDIO_COOKIE_ONLY", False)
+
+
+def studio_secure_cookie_enabled() -> bool:
+    return bool_env("LAZYBLOG_STUDIO_SECURE_COOKIE", False)
+
+
+def studio_cookie_attributes(*, secure: bool | None = None) -> str:
+    use_secure = studio_secure_cookie_enabled() if secure is None else secure
+    return f"Path=/; HttpOnly; SameSite=Lax; Max-Age={STUDIO_AUTH_TTL_SECONDS}" + (
+        "; Secure" if use_secure else ""
+    )
+
+
+def request_auth_mode(path: str, *, cookie_only: bool | None = None) -> str:
+    public_paths = {
+        "/api/health",
+        "/api/login",
+        "/login",
+        "/manifest.webmanifest",
+        "/service-worker.js",
+        "/icons/lazyblog.svg",
+        "/icons/lazyblog-192.png",
+        "/icons/lazyblog-512.png",
+    }
+    if path in public_paths:
+        return "public"
+    require_cookie = cookie_only if cookie_only is not None else studio_cookie_only_auth_enabled()
+    if require_cookie:
+        return "studio"
+    if path.startswith("/api/translate/") or path.startswith("/api/codex/"):
+        return "api"
+    return "studio"
+
+
 def studio_auth_secret() -> str:
     return studio_login_token() or os.environ.get("LAZYBLOG_API_TOKEN", "").strip()
 
@@ -7753,21 +7789,10 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
             return False
 
         def authorize_request(self, path: str) -> bool:
-            public_paths = {
-                "/api/health",
-                "/api/login",
-                "/login",
-                "/manifest.webmanifest",
-                "/service-worker.js",
-                "/icons/lazyblog.svg",
-                "/icons/lazyblog-192.png",
-                "/icons/lazyblog-512.png",
-            }
-            if path in public_paths:
+            mode = request_auth_mode(path)
+            if mode == "public":
                 return True
-            if path.startswith("/api/translate/"):
-                return self.require_api_auth(path)
-            if path.startswith("/api/codex/"):
+            if mode == "api":
                 return self.require_api_auth(path)
             return self.require_studio_auth(path)
 
@@ -7894,10 +7919,7 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
                     username = str(payload.get("username", "")).strip()
                     token = str(payload.get("token", "")).strip()
                     if studio_auth_enabled() and username == studio_username() and hmac.compare_digest(token, studio_login_token()):
-                        cookie = (
-                            f"{STUDIO_AUTH_COOKIE}={make_studio_cookie(username)}; "
-                            f"Path=/; HttpOnly; SameSite=Lax; Max-Age={STUDIO_AUTH_TTL_SECONDS}"
-                        )
+                        cookie = f"{STUDIO_AUTH_COOKIE}={make_studio_cookie(username)}; {studio_cookie_attributes()}"
                         self.send_json({"user": username}, headers={"Set-Cookie": cookie})
                         return
                     self.send_json({"error": "invalid LazyBlog Studio login"}, HTTPStatus.UNAUTHORIZED)
@@ -7905,7 +7927,12 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
                 if parsed.path == "/api/logout":
                     self.send_json(
                         {"status": "logged out"},
-                        headers={"Set-Cookie": f"{STUDIO_AUTH_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"},
+                        headers={
+                            "Set-Cookie": (
+                                f"{STUDIO_AUTH_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+                                + ("; Secure" if studio_secure_cookie_enabled() else "")
+                            )
+                        },
                     )
                     return
                 if not self.authorize_request(parsed.path):
@@ -8098,7 +8125,12 @@ def main() -> int:
     server = ThreadingHTTPServer((args.host, args.port), make_handler(app))
     print(f"LazyBlog Studio listening on http://{args.host}:{args.port}", flush=True)
     print(f"model={args.model} reasoning={args.reasoning} commit_push={args.commit_push}", flush=True)
-    print(f"studio_auth={'on' if studio_auth_enabled() else 'off'} user={studio_username()}", flush=True)
+    print(
+        f"studio_auth={'on' if studio_auth_enabled() else 'off'} "
+        f"mode={'cookie-only' if studio_cookie_only_auth_enabled() else 'api-compatible'} "
+        f"user={studio_username()}",
+        flush=True,
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
