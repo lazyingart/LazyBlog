@@ -1800,10 +1800,14 @@ Rules:
 
     def audio_jobs(self, statuses: set[str] | None = None) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
-        for path in CHAT_ROOT.glob("*/audio-jobs/*.json"):
+        try:
+            paths = list(CHAT_ROOT.glob("*/audio-jobs/*.json"))
+        except OSError:
+            return rows
+        for path in paths:
             try:
                 job = read_json(path)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, OSError, UnicodeError):
                 continue
             if statuses and str(job.get("status") or "") not in statuses:
                 continue
@@ -2673,13 +2677,24 @@ Rules:
             return current
 
     def chat_queue_items(self, session_id: str | None = None, statuses: set[str] | None = None) -> list[dict[str, Any]]:
-        roots = [self.chat_queue_dir(safe_session_id(session_id))] if session_id else [path / "queue" for path in CHAT_ROOT.glob("*") if path.is_dir()]
+        try:
+            roots = (
+                [self.chat_queue_dir(safe_session_id(session_id))]
+                if session_id
+                else [path / "queue" for path in CHAT_ROOT.glob("*") if path.is_dir()]
+            )
+        except OSError:
+            return []
         items: list[dict[str, Any]] = []
         for root in roots:
-            for path in root.glob("*.json"):
+            try:
+                paths = list(root.glob("*.json"))
+            except OSError:
+                continue
+            for path in paths:
                 try:
                     item = self.read_chat_queue_item(path)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, OSError, UnicodeError):
                     continue
                 if statuses and item.get("status") not in statuses:
                     continue

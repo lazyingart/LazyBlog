@@ -124,6 +124,22 @@ class AudioMessageTests(unittest.TestCase):
         self.assertEqual(retried["status"], "queued")
         self.assertEqual(retried["error"], "")
 
+    def test_unreadable_audio_job_does_not_stop_job_discovery(self) -> None:
+        job_dir = lazyblog_webapp.CHAT_ROOT / "session" / "audio-jobs"
+        job_dir.mkdir(parents=True)
+        (job_dir / "unreadable.json").write_text("{}", encoding="utf-8")
+
+        with patch.object(lazyblog_webapp, "read_json", side_effect=OSError(5, "I/O error")):
+            self.assertEqual(self.app.audio_jobs(), [])
+
+    def test_unreadable_chat_queue_item_does_not_stop_worker_discovery(self) -> None:
+        queue_dir = lazyblog_webapp.CHAT_ROOT / "session" / "queue"
+        queue_dir.mkdir(parents=True)
+        (queue_dir / "unreadable.json").write_text("{}", encoding="utf-8")
+
+        with patch.object(self.app, "read_chat_queue_item", side_effect=OSError(5, "I/O error")):
+            self.assertEqual(self.app.chat_queue_items(), [])
+
 
 if __name__ == "__main__":
     unittest.main()
