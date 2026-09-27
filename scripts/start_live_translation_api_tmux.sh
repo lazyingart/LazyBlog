@@ -20,9 +20,12 @@ fi
 PYTHON_BIN="${LAZYBLOG_PYTHON:-$HOME/miniconda3/bin/python3}"
 DEFAULT_HOST="${LAZYBLOG_WEBAPP_HOST:-127.0.0.1}"
 DEFAULT_PORT="${LAZYBLOG_WEBAPP_PORT:-8765}"
-DEFAULT_MODEL="${LAZYBLOG_WEBAPP_MODEL:-gpt-5.6-sol}"
+DEFAULT_MODEL="${LAZYBLOG_WEBAPP_MODEL:-gpt-5.5}"
 DEFAULT_REASONING="${LAZYBLOG_WEBAPP_REASONING:-low}"
-CODEX_BIN_DIR="${LAZYBLOG_CODEX_BIN_DIR:-$HOME/.local/codex-cli/node_modules/.bin}"
+# Prefer the maintained interactive installation after nvm is loaded. An old
+# hard-coded CLI can fail to parse the current model catalog even after login.
+# Set LAZYBLOG_CODEX_BIN_DIR in .env to pin a verified installation if needed.
+CODEX_BIN_DIR="${LAZYBLOG_CODEX_BIN_DIR:-}"
 NGROK_URL="${LAZYBLOG_NGROK_URL:-}"
 NGROK_BIN="${LAZYBLOG_NGROK_BIN:-$(command -v ngrok || echo ngrok)}"
 NGROK_POOLING="${LAZYBLOG_NGROK_POOLING:-0}"
@@ -47,7 +50,10 @@ cd "$ROOT_DIR"
 if [ -f "$HOME/.nvm/nvm.sh" ]; then
   source "$HOME/.nvm/nvm.sh"
 fi
-export PATH="$HOME/.local/bin:$CODEX_BIN_DIR:\$PATH"
+export PATH="$HOME/.local/bin:\$PATH"
+if [ -n "$CODEX_BIN_DIR" ]; then
+  export PATH="$CODEX_BIN_DIR:\$PATH"
+fi
 set -a
 if [ -f .env ]; then
   source .env
