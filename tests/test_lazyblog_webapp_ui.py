@@ -36,6 +36,45 @@ class StudioUITests(unittest.TestCase):
             subprocess.run(["node", "--check", "-"], input="\n".join(scripts), text=True, check=True, capture_output=True)
 
     @unittest.skipUnless(shutil.which("node"), "Node is needed for JS regression checks")
+    def test_compact_sync_status_keeps_errors_and_local_only_state(self):
+        start = web.INDEX_HTML.index("    function setComposerStatus(")
+        end = web.INDEX_HTML.index("    function resizeMobileComposer(", start)
+        script = """
+const assert = require('node:assert/strict');
+const nodes = {
+  composerStatus: {dataset:{}, setAttribute(key,value){this[key]=value;}},
+  composerStatusDetail: {dataset:{}, hidden:true},
+};
+const $ = id => nodes[id];
+const window = {matchMedia:()=>({matches:true})};
+const resizeMobileComposer = () => {};
+""" + web.INDEX_HTML[start:end] + """
+assert.equal(compactComposerStatus('Saved to workspace','saved',true),'Saved');
+for (const text of ['Saved on this device','Saved locally','Recovered draft']) {
+  assert.equal(compactComposerStatus(text,'saved',true),'On device');
+}
+assert.equal(compactComposerStatus('Saving draft...','saving',true),'Saving…');
+assert.equal(compactComposerStatus('Listening in English','',true),'Listening…');
+assert.equal(compactComposerStatus('Network failed','error',true),'Check sync');
+assert.equal(compactComposerStatus('Saved locally','saved',false),'Saved locally');
+setComposerStatus('Network failed; draft saved on this device','error');
+assert.equal(nodes.composerStatusDetail.hidden,false);
+assert.equal(nodes.composerStatus['aria-expanded'],'true');
+assert.equal(nodes.composerStatus.textContent,'Check sync');
+assert.match(nodes.composerStatusDetail.textContent,/Network failed/);
+assert.match(nodes.composerStatus['aria-label'],/Network failed/);
+setComposerStatus('Saved to workspace','saved');
+assert.equal(nodes.composerStatusDetail.hidden,true);
+assert.equal(nodes.composerStatus['aria-expanded'],'false');
+// A detail panel opened manually must stay open as status updates arrive.
+nodes.composerStatusDetail.hidden=false;
+nodes.composerStatusDetail.dataset.autoError='false';
+setComposerStatus('Saving draft...','saving');
+assert.equal(nodes.composerStatusDetail.hidden,false);
+"""
+        subprocess.run(["node", "-"], input=script, text=True, check=True, capture_output=True, timeout=5)
+
+    @unittest.skipUnless(shutil.which("node"), "Node is needed for JS regression checks")
     def test_late_history_response_cannot_replace_new_conversation(self):
         def function(name, next_name):
             start = web.INDEX_HTML.index(f"    async function {name}(")

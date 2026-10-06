@@ -6569,7 +6569,7 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <div class="chat-head-actions">
           <div class="status"><span class="dot"></span><span id="modelLabel">Codex ready</span></div>
-          <button id="artifactButton" class="artifact-trigger" type="button" aria-label="Open artifacts" title="Images, documents, and other outputs">Files <span id="artifactBadge" class="artifact-badge" hidden>0</span></button>
+          <button id="artifactButton" class="artifact-trigger" type="button" aria-label="Open artifacts" title="Images, documents, and other outputs"><span class="full-ui">Files</span><svg class="compact-ui" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M3 7h7l2 2h9v11H3zM3 7V4h7l2 3h9v2"/></svg><span id="artifactBadge" class="artifact-badge" hidden>0</span></button>
           <button id="settingsButton" class="settings-trigger" type="button" aria-label="Open settings" title="Model settings">⚙</button>
         </div>
       </header>
@@ -6586,7 +6586,7 @@ INDEX_HTML = r"""<!doctype html>
             <path d="M65 88L67 79L75 84Z" fill="#252720"/>
           </svg>
           <div class="eyebrow">The beginning of something</div>
-          <h2>Good things start<br>with <em>a thought.</em></h2>
+          <h2><span class="full-ui">Good things start<br>with <em>a thought.</em></span><span class="compact-ui">What’s on your mind?</span></h2>
           <p>A passing idea, a voice note, a page worth keeping. Bring it here. We’ll find the words together.</p>
           <div class="welcome-prompts">
             <button type="button" data-starter="Something I noticed today: ">Keep a thought ↗</button>
@@ -6612,7 +6612,7 @@ INDEX_HTML = r"""<!doctype html>
             </svg>
           </button>
           <span id="attachmentHint" class="sub attach-hint">Attach files, images, or video</span>
-          <span id="composerStatus" class="composer-sync-status" role="status" aria-live="polite">Saved locally</span>
+          <button id="composerStatus" type="button" class="composer-sync-status" aria-live="polite" aria-expanded="false" aria-controls="composerStatusDetail" title="Saved locally">Saved locally</button>
         </div>
         <div id="voiceLanguageMenu" class="voice-language-menu" hidden>
           <div class="voice-language-sheet" role="dialog" aria-modal="true" aria-labelledby="voiceLanguageTitle">
@@ -6629,14 +6629,15 @@ INDEX_HTML = r"""<!doctype html>
           </div>
           <div id="composerReplyPreview" class="composer-reply-preview"></div>
         </div>
-        <textarea id="messageInput" aria-label="Your message" placeholder="What’s on your mind? Write, speak, or bring something along…"></textarea>
-        <div class="row">
+        <textarea id="messageInput" rows="1" aria-label="Your message" placeholder="Message…"></textarea>
+        <div class="row composer-actions">
           <button id="quotePreviousButton" class="secondary attach-btn" type="button" aria-label="Reply to latest message" title="Reply to latest message">❝</button>
-          <button id="sendButton" type="submit">Send & Store</button>
-          <button id="draftButton" class="secondary" type="button">Draft Post</button>
-          <button id="publishToggle" class="secondary mobile-publish-toggle" type="button" aria-label="Toggle publish tools" aria-controls="publishPanel" aria-expanded="false"><span class="triangle"></span><span class="sr-only">Publish tools</span></button>
+          <button id="sendButton" type="submit" aria-label="Send message" title="Send and store message"><span class="full-ui">Send &amp; Store</span><svg class="compact-ui" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6"/></svg></button>
+          <button id="draftButton" class="secondary" type="button" aria-label="Draft a post"><span class="full-ui">Draft Post</span><span class="compact-ui">Draft</span></button>
+          <button id="publishToggle" class="secondary mobile-publish-toggle" type="button" aria-label="Toggle publish tools" aria-controls="publishPanel" aria-expanded="false"><span class="triangle full-ui"></span><span class="compact-ui">Posts</span><span class="sr-only">Publish tools</span></button>
           <span class="sub" id="busyLabel"></span>
         </div>
+        <div id="composerStatusDetail" class="composer-status-detail" role="status" hidden></div>
       </form>
     </section>
     <aside class="panel publish" id="publishPanel">
@@ -6681,10 +6682,12 @@ INDEX_HTML = r"""<!doctype html>
         <button id="publishButton" class="accent" type="button">Publish Selected</button>
         <button id="redraftButton" class="secondary" type="button">Force Redraft</button>
       </div>
+      <details class="studio-tools draft-details"><summary>Markdown draft</summary>
       <div class="field">
         <label for="draftPreview">Latest Markdown draft</label>
         <textarea id="draftPreview" class="preview" readonly></textarea>
       </div>
+      </details>
       <div id="publishLog" class="log">No draft yet.</div>
       <details class="studio-tools"><summary>Categories &amp; organization</summary>
       <div class="monitor-head">
@@ -6955,8 +6958,54 @@ INDEX_HTML = r"""<!doctype html>
 
     function setComposerStatus(message, kind = "") {
       const root = $("composerStatus");
-      root.textContent = message || "";
+      root.dataset.message = message || "";
+      root.dataset.kind = kind;
+      root.title = message || "Sync status";
+      root.setAttribute("aria-label", `Sync status: ${message || "unknown"}. Show details.`);
+      root.textContent = compactComposerStatus(message, kind, window.matchMedia("(max-width: 720px)").matches);
       root.className = `composer-sync-status${kind ? ` ${kind}` : ""}`;
+      const detail = $("composerStatusDetail");
+      detail.textContent = message || "";
+      if (kind === "error") {
+        detail.hidden = false;
+        detail.dataset.autoError = "true";
+        root.setAttribute("aria-expanded", "true");
+      } else if (detail.dataset.autoError === "true") {
+        detail.hidden = true;
+        detail.dataset.autoError = "false";
+        root.setAttribute("aria-expanded", "false");
+      }
+      resizeMobileComposer();
+    }
+
+    function compactComposerStatus(message, kind, mobile) {
+      if (!mobile) return message || "";
+      if (kind === "error") return "Check sync";
+      if (/^Listening/i.test(message || "")) return "Listening…";
+      if (kind === "saving") return "Saving…";
+      if (/device|locally|recovered/i.test(message || "")) return "On device";
+      return kind === "saved" ? "Saved" : message || "";
+    }
+
+    function resizeMobileComposer() {
+      const input = $("messageInput");
+      if (!window.matchMedia("(max-width: 720px)").matches) {
+        input.style.height = "";
+        return;
+      }
+      input.style.height = "auto";
+      input.style.height = `${Math.max(44, Math.min(124, input.scrollHeight + 2))}px`;
+    }
+
+    function syncMobileViewport() {
+      const viewport = window.visualViewport;
+      if (viewport && Math.abs(viewport.scale - 1) < 0.01) {
+        document.documentElement.style.setProperty("--studio-viewport-height", `${viewport.height}px`);
+        document.documentElement.style.setProperty("--studio-viewport-top", `${viewport.offsetTop}px`);
+      }
+      const status = $("composerStatus");
+      status.textContent = compactComposerStatus(status.dataset.message || status.title, status.dataset.kind || "", window.matchMedia("(max-width: 720px)").matches);
+      resizeMobileComposer();
     }
 
     function scheduleComposerSave(delay = 450) {
@@ -8400,7 +8449,12 @@ INDEX_HTML = r"""<!doctype html>
       const status = attachment.analysis_status ? ` · ${attachment.analysis_status}` : "";
       const note = attachment.analysis_note ? ` · ${attachment.analysis_note}` : "";
       meta.textContent = `${attachment.kind} · ${attachment.mime} · ${formatBytes(attachment.size || 0)}${status}${note}`;
-      item.appendChild(meta);
+      const details = document.createElement("details");
+      details.className = "attachment-details";
+      const summary = document.createElement("summary");
+      summary.textContent = `${attachment.name || attachment.kind || "Attachment"} · ${formatBytes(attachment.size || 0)}`;
+      details.append(summary, meta);
+      item.appendChild(details);
       return item;
     }
 
@@ -9141,6 +9195,12 @@ INDEX_HTML = r"""<!doctype html>
     $("publishButton").addEventListener("click", () => publishPost(false));
     $("redraftButton").addEventListener("click", () => publishPost(true));
     $("refreshSessions").addEventListener("click", loadSessions);
+    $("composerStatus").addEventListener("click", () => {
+      const detail = $("composerStatusDetail");
+      detail.hidden = !detail.hidden;
+      detail.dataset.autoError = "false";
+      $("composerStatus").setAttribute("aria-expanded", String(!detail.hidden));
+    });
     document.querySelectorAll("[data-starter]").forEach((button) => {
       button.addEventListener("click", () => {
         const input = $("messageInput");
@@ -9264,6 +9324,12 @@ INDEX_HTML = r"""<!doctype html>
         navigator.serviceWorker.register("/service-worker.js").catch(() => {});
       });
     }
+    window.addEventListener("resize", syncMobileViewport, { passive: true });
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener("resize", syncMobileViewport, { passive: true });
+      window.visualViewport.addEventListener("scroll", syncMobileViewport, { passive: true });
+    }
+    syncMobileViewport();
     loadSpeechLanguage();
     initSpeechRecognition();
     loadComposerDraft().catch(() => {});

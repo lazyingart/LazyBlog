@@ -56,6 +56,67 @@ being live is not proof that a particular phone has refreshed its shortcut.
 Do not clear site data to force an icon update: it may remove unsynced local
 drafts and login state.
 
+## Compact phone workspace (October 6 refinement)
+
+The mobile surface prioritizes the conversation, not explanatory UI text. At
+720px and below there is one header with the conversation title, history menu,
+artifact folder, and settings. The repeated brand header, message-count/path
+metadata, model badge, welcome illustration, and introductory paragraphs are
+not shown on the main phone surface. History and model configuration remain
+available through their existing controls. Desktop keeps its three-column layout.
+
+The composer is a two-row CSS grid using the existing input and handlers:
+
+- Attach, auto-growing message input, and a 44px send arrow.
+- Native dictation, audio message, short sync status, Draft, and Posts.
+
+The textarea retains a 16px font to avoid focus zoom, starts at 44px, and grows
+up to 124px. Message text remains 14px. A visual-viewport resize/scroll listener
+keeps the phone shell within the visible viewport, with safe-area padding;
+pinch-zoom changes are not treated as keyboard resizing. No polling or new
+network requests are added by this layout.
+
+Quote previews and horizontally scrollable attachment chips/thumbnails appear
+above the input only when needed. Message-level quote controls remain; the
+duplicate composer shortcut is hidden on phones. Attachment details (MIME,
+analysis status, notes) are expandable instead of repeated below every preview.
+The raw Markdown draft is collapsed in the Posts drawer; post selection,
+WordPress ID/status, categories, and publishing controls retain their behavior.
+Draft and Posts are not renamed publish actions: Draft prepares Markdown; Posts
+opens the existing publishing controls without submitting anything.
+
+Short status is not a claim that every draft reached the server. “On device”
+means a local-only/recovered copy; “Saved” is used for the normal server-save
+result. Tap the status to read its full text. Errors automatically expand the
+full explanation and use “Check sync”; that automatic expansion closes after
+recovery, while a manually opened detail panel stays open. Autosave, queueing,
+audio, publishing, and authentication endpoints are unchanged.
+
+Browser measurements at **390 × 844**, empty composer, no safe-area inset:
+
+| Area | Previous | Compact |
+| --- | ---: | ---: |
+| Header area | 127px | 57px |
+| Composer | 207px | 101px |
+| Conversation viewport | 510px | 686px |
+
+This is about 35% more vertical conversation space. Actual device keyboards,
+safe areas, open attachment/quote previews, and longer input change the numbers.
+The synthetic screenshot [compact mobile workspace](../demos/studio-compact-mobile.png)
+shows the revised layout; it contains no personal chat data.
+
+Regression coverage includes compact/local-only/error status behavior, manual
+detail expansion, real DOM send/reply, quote/clear, multiple file selections and
+removal, textarea growth/shrink, autosave failure followed by reload/recovery,
+dictation-language long press, centered settings, and drawer open/close. Browser
+viewports tested: 320×568, 390×844, 430×932, 720×844, 768×844, 1024×768, 1500×940,
+390×430, and 667×375. The short viewports exercise keyboard-like/landscape space
+constraints; they are not a claim of physical iOS/Android keyboard testing.
+
+Deploy the Python template and embedded CSS together, as for the original
+Atelier release. Root HTML is not service-worker cached, so reload the app once;
+do not clear site data or uninstall the PWA, which could discard unsynced drafts.
+
 ## Persistent login
 
 “Keep me signed in on this device” is checked by default.
