@@ -1,5 +1,6 @@
 .env
 .env.local
+.runtime/
 content/
 out/
 tmp/

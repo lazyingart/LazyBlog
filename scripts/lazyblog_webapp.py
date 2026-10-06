@@ -112,7 +112,9 @@ DEFAULT_PROFILE_SETTINGS = {
 }
 REASONING_LEVELS = {"low", "medium", "high", "xhigh"}
 STUDIO_AUTH_COOKIE = "lazyblog_studio_auth"
-STUDIO_AUTH_TTL_SECONDS = 60 * 60 * 24 * 30
+STUDIO_AUTH_TTL_SECONDS = 60 * 60 * 24 * 90
+STUDIO_SESSION_TTL_SECONDS = 60 * 60 * 24
+STUDIO_AUTH_RENEW_INTERVAL_SECONDS = 60 * 60 * 24
 
 
 class WebAppError(RuntimeError):
@@ -179,9 +181,11 @@ def studio_secure_cookie_enabled() -> bool:
     return bool_env("LAZYBLOG_STUDIO_SECURE_COOKIE", False)
 
 
-def studio_cookie_attributes(*, secure: bool | None = None) -> str:
+def studio_cookie_attributes(*, secure: bool | None = None, remember: bool = True) -> str:
     use_secure = studio_secure_cookie_enabled() if secure is None else secure
-    return f"Path=/; HttpOnly; SameSite=Lax; Max-Age={STUDIO_AUTH_TTL_SECONDS}" + (
+    return "Path=/; HttpOnly; SameSite=Lax" + (
+        f"; Max-Age={STUDIO_AUTH_TTL_SECONDS}" if remember else ""
+    ) + (
         "; Secure" if use_secure else ""
     )
 
@@ -211,16 +215,15 @@ def studio_auth_secret() -> str:
     return studio_login_token() or os.environ.get("LAZYBLOG_API_TOKEN", "").strip()
 
 
-def make_studio_cookie(username: str) -> str:
-    expires = int(time.time()) + STUDIO_AUTH_TTL_SECONDS
-    message = f"{username}:{expires}"
+def make_studio_cookie(username: str, *, remember: bool = True) -> str:
+    expires = int(time.time()) + (STUDIO_AUTH_TTL_SECONDS if remember else STUDIO_SESSION_TTL_SECONDS)
+    message = f"{username}:{expires}:{'p' if remember else 's'}"
     signature = hmac.new(studio_auth_secret().encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
     return urllib.parse.quote(f"{message}:{signature}", safe="")
 
 
-def verify_studio_cookie(raw_cookie: str) -> bool:
-    if not studio_auth_enabled():
-        return True
+def studio_cookie_details(raw_cookie: str) -> tuple[str, int, bool] | None:
+    """Verify signed lifetime and mode, accepting pre-Atelier cookies as persistent."""
     cookies: dict[str, str] = {}
     for chunk in raw_cookie.split(";"):
         name, separator, value = chunk.strip().partition("=")
@@ -228,17 +231,40 @@ def verify_studio_cookie(raw_cookie: str) -> bool:
             cookies[name] = value
     raw_value = cookies.get(STUDIO_AUTH_COOKIE, "")
     if not raw_value:
-        return False
+        return None
     try:
-        username, expires_text, signature = urllib.parse.unquote(raw_value).split(":", 2)
+        parts = urllib.parse.unquote(raw_value).split(":")
+        if len(parts) == 3:
+            username, expires_text, signature = parts
+            remember = True
+        elif len(parts) == 4 and parts[2] in {"p", "s"}:
+            username, expires_text, mode, signature = parts
+            remember = mode == "p"
+        else:
+            return None
         expires = int(expires_text)
     except ValueError:
-        return False
-    if username != studio_username() or expires < int(time.time()):
-        return False
-    message = f"{username}:{expires}"
+        return None
+    if (not studio_auth_enabled() or username != studio_username() or expires <= int(time.time())
+            or not re.fullmatch(r"[0-9a-f]{64}", signature)):
+        return None
+    message = ":".join(parts[:-1])
     expected = hmac.new(studio_auth_secret().encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(signature, expected)
+    return (username, expires, remember) if hmac.compare_digest(signature, expected) else None
+
+
+def verify_studio_cookie(raw_cookie: str) -> bool:
+    return not studio_auth_enabled() or studio_cookie_details(raw_cookie) is not None
+
+
+def renewed_studio_cookie(raw_cookie: str) -> str | None:
+    details = studio_cookie_details(raw_cookie)
+    if details is None:
+        return None
+    username, expires, remember = details
+    if not remember or expires > int(time.time()) + STUDIO_AUTH_TTL_SECONDS - STUDIO_AUTH_RENEW_INTERVAL_SECONDS:
+        return None
+    return f"{STUDIO_AUTH_COOKIE}={make_studio_cookie(username)}; {studio_cookie_attributes()}"
 
 
 def slugify(value: str, fallback: str = "post") -> str:
@@ -6093,12 +6119,15 @@ Rules:
         }
 
 
+STUDIO_THEME_CSS = (ROOT_DIR / "web" / "studio-theme.css").read_text(encoding="utf-8")
+
+
 INDEX_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#16a394">
+  <meta name="theme-color" content="#f3f1e9">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-title" content="LazyBlog Studio">
   <link rel="manifest" href="/manifest.webmanifest">
@@ -6111,7 +6140,6 @@ INDEX_HTML = r"""<!doctype html>
   <script src="/assets/vendor/katex-auto-render.js"></script>
   <title>LazyBlog Studio</title>
   <style>
-    @import url("https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,650&family=Newsreader:opsz,wght@6..72,400;6..72,600&display=swap");
     :root {
       --ink: #15231e;
       --muted: #607069;
@@ -6511,39 +6539,60 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
   </style>
+  <style id="studio-theme">__STUDIO_THEME__</style>
 </head>
 <body>
   <main class="shell" id="shell">
     <button id="mobileMenuToggle" class="mobile-menu-toggle" type="button" aria-label="Toggle chat history" aria-expanded="false">
       <span></span><span></span><span></span>
     </button>
-    <div class="mobile-top-title">LazyBlog Studio</div>
+    <div class="mobile-top-title">LazyBlog</div>
     <aside class="panel side">
       <div class="brand">
-        <h1>LazyBlog Studio</h1>
-        <p class="sub">Chat becomes Markdown memory, then a WordPress-ready post.</p>
+        <div class="brand-lockup"><span class="studio-mark" aria-hidden="true">l.</span><h1>LazyBlog<small>Writing studio</small></h1></div>
+        <p class="sub">A little space for your thoughts.<br>A home for what they become.</p>
       </div>
       <div class="row">
-        <button id="newSession" class="secondary" type="button">New chat</button>
-        <button id="refreshSessions" class="secondary" type="button">Refresh</button>
+        <button id="newSession" class="secondary" type="button">＋ New conversation</button>
+        <button id="refreshSessions" class="secondary" type="button" aria-label="Refresh conversations" title="Refresh conversations">↻</button>
       </div>
+      <div class="sidebar-label eyebrow"><span>Your conversations</span><span>↙</span></div>
       <div id="sessions" class="session-list"></div>
+      <div class="sidebar-foot"><div><span class="eyebrow">LazyingArt</span><p>Make room for a thought.</p></div><button id="signOutButton" type="button">Sign out</button></div>
     </aside>
     <section class="panel chat">
       <header class="chat-head">
         <div>
-          <h2 id="chatTitle">New chat</h2>
-          <p class="sub" id="chatMeta">Messages will be saved as Markdown.</p>
+          <h2 id="chatTitle">A fresh page</h2>
+          <p class="sub" id="chatMeta">Your words, kept here.</p>
         </div>
         <div class="chat-head-actions">
           <div class="status"><span class="dot"></span><span id="modelLabel">Codex ready</span></div>
-          <button id="artifactButton" class="artifact-trigger" type="button" aria-label="Open backend pipe">Pipe <span id="artifactBadge" class="artifact-badge" hidden>0</span></button>
+          <button id="artifactButton" class="artifact-trigger" type="button" aria-label="Open artifacts" title="Images, documents, and other outputs">Files <span id="artifactBadge" class="artifact-badge" hidden>0</span></button>
           <button id="settingsButton" class="settings-trigger" type="button" aria-label="Open settings" title="Model settings">⚙</button>
         </div>
       </header>
       <div id="messages" class="messages">
         <button id="moreMessages" class="more-messages" type="button">More messages</button>
         <div id="messageList" class="message-list"></div>
+        <div class="studio-welcome" id="studioWelcome">
+          <svg class="welcome-art" viewBox="0 0 124 100" fill="none" aria-hidden="true">
+            <circle cx="92" cy="31" r="26" fill="#d6e7a8"/>
+            <path d="M11 76L35 11L95 33L71 96Z" fill="#eee8d9" stroke="#b9b6a6"/>
+            <path d="M25 15H84V94H25Z" fill="#fffefb" stroke="#34372b"/>
+            <path d="M37 37H72M37 47H72M37 57H59" stroke="#b8b9a9"/>
+            <path d="M67 79L93 40L101 45L75 84L65 88Z" fill="#b83e2c"/>
+            <path d="M65 88L67 79L75 84Z" fill="#252720"/>
+          </svg>
+          <div class="eyebrow">The beginning of something</div>
+          <h2>Good things start<br>with <em>a thought.</em></h2>
+          <p>A passing idea, a voice note, a page worth keeping. Bring it here. We’ll find the words together.</p>
+          <div class="welcome-prompts">
+            <button type="button" data-starter="Something I noticed today: ">Keep a thought ↗</button>
+            <button type="button" data-starter="Help me explore this idea: ">Explore an idea ↗</button>
+            <button type="button" data-starter="Help me draft a new post about ">Begin a story ↗</button>
+          </div>
+        </div>
       </div>
       <form id="composer" class="composer">
         <input id="attachmentInput" class="file-input" type="file" multiple>
@@ -6579,7 +6628,7 @@ INDEX_HTML = r"""<!doctype html>
           </div>
           <div id="composerReplyPreview" class="composer-reply-preview"></div>
         </div>
-        <textarea id="messageInput" placeholder="Write a note, idea, outline, memory, or instruction. The reply tool will store it and respond; the task tool can turn the session into a post."></textarea>
+        <textarea id="messageInput" aria-label="Your message" placeholder="What’s on your mind? Write, speak, or bring something along…"></textarea>
         <div class="row">
           <button id="quotePreviousButton" class="secondary attach-btn" type="button" aria-label="Reply to latest message" title="Reply to latest message">❝</button>
           <button id="sendButton" type="submit">Send & Store</button>
@@ -6590,13 +6639,14 @@ INDEX_HTML = r"""<!doctype html>
       </form>
     </section>
     <aside class="panel publish" id="publishPanel">
+      <div class="eyebrow">From thought to page</div>
       <div class="publish-head">
-        <h2>Publish</h2>
+        <h2>Your next story</h2>
         <button id="publishClose" class="secondary publish-close" type="button" aria-label="Hide publish tools">Hide</button>
       </div>
-      <p class="sub">Chat is memory. Posts are independent local projects that can be drafted, selected, published, or updated through controlled APIs.</p>
+      <p class="sub">Keep the conversation flowing.<br>Shape a post when you’re ready.</p>
       <div class="field">
-        <label for="postProjectSelect">Selected post project</label>
+        <label for="postProjectSelect">Selected post</label>
         <select id="postProjectSelect">
           <option value="">No post project selected</option>
         </select>
@@ -6623,7 +6673,7 @@ INDEX_HTML = r"""<!doctype html>
         </select>
       </div>
       <div class="field">
-        <label for="extraInstruction">Extra instruction for the task tool</label>
+        <label for="extraInstruction">A little direction</label>
         <input id="extraInstruction" placeholder="e.g. make this a journal, category Journals, keep it reflective">
       </div>
       <div class="row">
@@ -6635,6 +6685,7 @@ INDEX_HTML = r"""<!doctype html>
         <textarea id="draftPreview" class="preview" readonly></textarea>
       </div>
       <div id="publishLog" class="log">No draft yet.</div>
+      <details class="studio-tools"><summary>Categories &amp; organization</summary>
       <div class="monitor-head">
         <h2>Categories</h2>
         <button id="syncCategories" class="secondary" type="button">Sync</button>
@@ -6648,12 +6699,15 @@ INDEX_HTML = r"""<!doctype html>
         <button id="searchCategories" class="secondary" type="button">Search</button>
       </div>
       <div id="categoryLog" class="log">Category mirror is loaded on demand.</div>
+      </details>
+      <details class="studio-tools"><summary>Background activity</summary>
       <div class="monitor-head">
-        <h2>Codex Monitor</h2>
+        <h2>Task monitor</h2>
         <button id="refreshJobs" class="secondary" type="button">Poll</button>
       </div>
       <p class="sub">Background prompt-tool jobs are durable and pollable.</p>
       <div id="jobs" class="job-list"></div>
+      </details>
     </aside>
   </main>
   <div id="sessionActionModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="sessionActionTitle">
@@ -6789,6 +6843,7 @@ INDEX_HTML = r"""<!doctype html>
   <script>
     const state = {
       sessionId: null,
+      sessionViewRevision: 0,
       busy: false,
       messagePage: null,
       loadingMore: false,
@@ -6958,7 +7013,8 @@ INDEX_HTML = r"""<!doctype html>
           }
           clearLocalComposer("new");
           $("chatTitle").textContent = data.session && data.session.title ? data.session.title : "Untitled chat";
-          $("chatMeta").textContent = `0 messages stored in content/chat/${newSessionId} · composer saved`;
+          $("chatMeta").textContent = "Unsent thought · Saved to your workspace";
+          $("chatMeta").title = `content/chat/${newSessionId}`;
           startEventStream(true);
           loadSessions().catch(() => {});
         }
@@ -7580,6 +7636,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function clearChat() {
+      state.sessionViewRevision += 1;
       stopSpeechRecognition();
       state.sessionId = null;
       state.messagePage = null;
@@ -7595,8 +7652,9 @@ INDEX_HTML = r"""<!doctype html>
       renderArtifactBadge();
       renderArtifactList();
       clearComposerAttachments();
-      $("chatTitle").textContent = "New chat";
-      $("chatMeta").textContent = "Messages will be saved as Markdown.";
+      $("chatTitle").textContent = "A fresh page";
+      $("chatMeta").textContent = "Your words, kept here.";
+      $("chatMeta").title = "";
       $("messageList").innerHTML = "";
       $("messages").scrollTop = 0;
       updateMoreButton();
@@ -7627,10 +7685,12 @@ INDEX_HTML = r"""<!doctype html>
         const el = document.createElement("div");
         el.className = "session" + (item.id === state.sessionId ? " active" : "");
         const title = item.title || item.id;
+        const changed = new Date(item.updated_at || "");
+        const dateLabel = Number.isNaN(changed.getTime()) ? "" : new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(changed);
         el.innerHTML = `
           <div class="session-main">
             <strong>${escapeHtml(title)}</strong>
-            <span>${escapeHtml(item.updated_at || "")}</span>
+            <span title="${escapeHtml(item.updated_at || "")}">${escapeHtml(dateLabel)}</span>
           </div>
           <button class="session-more" type="button" aria-label="Chat actions" aria-expanded="false">&#8943;</button>
         `;
@@ -8562,7 +8622,8 @@ INDEX_HTML = r"""<!doctype html>
       const queueText = active
         ? ` · ${active} queued/running${latest && latest.attachment_analysis_status ? ` · attachments ${latest.attachment_analysis_status}` : ""}`
         : " · idle";
-      $("chatMeta").textContent = `${payload.session.message_count || 0} messages stored in content/chat/${payload.session.id}${queueText}`;
+      $("chatMeta").textContent = `${payload.session.message_count || 0} messages · Saved to your workspace${active ? queueText : ""}`;
+      $("chatMeta").title = `content/chat/${payload.session.id}${queueText}`;
       setQueueStatus(payload.chat_queue || null);
       if (payload.draft) {
         $("draftPreview").value = payload.draft.markdown || "";
@@ -8611,10 +8672,11 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     async function loadSessions(options = {}) {
+      const revision = state.sessionViewRevision;
       const data = await api("/api/sessions");
       const sessions = data.sessions || [];
       renderSessions(sessions);
-      if (options.autoload && !state.sessionId && sessions.length > 0) {
+      if (options.autoload && revision === state.sessionViewRevision && !state.sessionId && sessions.length > 0) {
         await loadSession(sessions[0].id);
       }
     }
@@ -8626,11 +8688,14 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     async function loadSession(id) {
+      const revision = ++state.sessionViewRevision;
       if (state.sessionId && state.sessionId !== id && state.composerDirty) {
         await saveComposerDraft();
       }
+      if (revision !== state.sessionViewRevision) return;
       stopSpeechRecognition();
       const data = await api(`/api/session?id=${encodeURIComponent(id)}&limit=10`);
+      if (revision !== state.sessionViewRevision) return;
       renderSession(data);
       state.composerDirty = false;
       await loadComposerDraft({ force: true });
@@ -8638,9 +8703,12 @@ INDEX_HTML = r"""<!doctype html>
 
     async function pollActiveSession() {
       if (!state.sessionId || state.sessionPollInFlight || state.loadingMore) return;
+      const revision = state.sessionViewRevision;
+      const sessionId = state.sessionId;
       state.sessionPollInFlight = true;
       try {
-        const data = await api(`/api/session?id=${encodeURIComponent(state.sessionId)}&limit=10`);
+        const data = await api(`/api/session?id=${encodeURIComponent(sessionId)}&limit=10`);
+        if (revision !== state.sessionViewRevision || sessionId !== state.sessionId) return;
         mergeSessionPayload(data);
       } finally {
         state.sessionPollInFlight = false;
@@ -9072,6 +9140,30 @@ INDEX_HTML = r"""<!doctype html>
     $("publishButton").addEventListener("click", () => publishPost(false));
     $("redraftButton").addEventListener("click", () => publishPost(true));
     $("refreshSessions").addEventListener("click", loadSessions);
+    document.querySelectorAll("[data-starter]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const input = $("messageInput");
+        if (!input.value.trim()) input.value = button.dataset.starter;
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.focus();
+      });
+    });
+    $("signOutButton").addEventListener("click", async () => {
+      const button = $("signOutButton");
+      button.disabled = true;
+      try {
+        // Save unsent text before closing this device's authenticated session.
+        persistLocalComposer($("messageInput").value, { synced: !state.composerDirty });
+        if (state.composerDirty) await saveComposerDraft({ throwOnError: true });
+        if (state.composerDirty) await saveComposerDraft({ throwOnError: true });
+        if (state.composerDirty) throw new Error("Your draft has a sync conflict. Resolve it before signing out.");
+        await api("/api/logout", {});
+        window.location.href = "/login";
+      } catch (err) {
+        $("busyLabel").textContent = `Could not sign out: ${err.message}`;
+        button.disabled = false;
+      }
+    });
     $("refreshJobs").addEventListener("click", loadJobs);
     $("mobileMenuToggle").addEventListener("click", () => {
       const opened = shell.classList.toggle("nav-open");
@@ -9222,71 +9314,62 @@ LOGIN_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#0f766e">
+  <meta name="theme-color" content="#f3f1e9">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icons/lazyblog.svg" type="image/svg+xml">
   <title>LazyBlog Studio Login</title>
-  <style>
-    @import url("https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,650&family=Newsreader:opsz,wght@6..72,400;6..72,600&display=swap");
-    :root { --ink: #1d2520; --muted: #667069; --teal: #0f766e; --clay: #d96b43; --gold: #e3a92f; }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      display: grid;
-      place-items: center;
-      color: var(--ink);
-      font-family: "Newsreader", Georgia, serif;
-      background: #edf8f4;
-      padding: 24px;
-    }
-    .card {
-      width: min(460px, 100%);
-      border: 1px solid rgba(39, 55, 46, 0.16);
-      border-radius: 32px;
-      padding: 30px;
-      background: rgba(255, 250, 240, 0.86);
-      box-shadow: 0 24px 70px rgba(28, 45, 38, 0.16);
-      backdrop-filter: blur(18px);
-    }
-    h1 { font-family: "Fraunces", Georgia, serif; font-size: 42px; line-height: 1; letter-spacing: 0; margin: 0; }
-    p { color: var(--muted); line-height: 1.5; }
-    label { display: block; font-size: 13px; color: var(--muted); margin: 16px 0 6px 4px; }
-    input { width: 100%; border: 1px solid rgba(39, 55, 46, 0.18); border-radius: 18px; background: rgba(255, 255, 255, 0.7); padding: 12px 14px; font: inherit; outline: none; }
-    input:focus { border-color: rgba(15, 118, 110, 0.55); box-shadow: 0 0 0 4px rgba(15, 118, 110, 0.12); }
-    button { width: 100%; margin-top: 20px; border: 0; border-radius: 999px; padding: 13px 18px; background: var(--gold); color: #231b12; font: inherit; font-weight: 700; cursor: pointer; }
-    .error { margin-top: 14px; color: #8a2b12; min-height: 1.4em; }
-    .hint { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color: var(--teal); overflow-wrap: anywhere; }
-  </style>
+  <style>* { box-sizing: border-box; } __STUDIO_THEME__</style>
 </head>
-<body>
-  <form class="card" id="loginForm">
-    <h1>LazyBlog Studio</h1>
-    <p>Public tunnel access is locked. Log in as <span class="hint">__USERNAME__</span> with the Studio token.</p>
-    <label for="username">Account</label>
-    <input id="username" name="username" value="__USERNAME__" autocomplete="username" required>
-    <label for="token">Login token</label>
-    <input id="token" name="token" type="password" autocomplete="current-password" autofocus required>
-    <button type="submit">Enter Studio</button>
-    <div class="error" id="error"></div>
-  </form>
+<body class="studio-login">
+  <main class="login-layout">
+    <section class="login-story" aria-label="LazyBlog Studio">
+      <div class="login-wordmark"><span class="studio-mark" aria-hidden="true">l.</span>LazyBlog Studio</div>
+      <div><h1>A life of ideas.<br>A place to<br><em>make them yours.</em></h1><p>From the first passing thought to the last line. Your own space to collect, connect, and create.</p></div>
+      <div class="eyebrow login-edition">A writing space by LazyingArt</div><div class="login-art" aria-hidden="true"></div>
+    </section>
+    <form class="login-form" id="loginForm">
+      <div class="eyebrow">Your private workspace</div>
+      <h2>Welcome back.</h2>
+      <p>Your notes, conversations, and unfinished thoughts are right where you left them.</p>
+      <label for="username">Username</label>
+      <input id="username" name="username" value="__USERNAME__" autocomplete="username" required>
+      <label for="token">Password / access token</label>
+      <input id="token" name="token" type="password" autocomplete="current-password" required>
+      <label class="remember"><input id="rememberLogin" type="checkbox" checked>Keep me signed in on this device</label>
+      <button class="login-submit" type="submit">Enter your studio &nbsp; ↗</button>
+      <div class="login-error" id="error" role="alert"></div>
+      <p class="login-note">A private space. A lasting thought.<br>On a shared device? Uncheck “Keep me signed in.”</p>
+    </form>
+  </main>
   <script>
     document.getElementById("loginForm").addEventListener("submit", async (event) => {
       event.preventDefault();
       const error = document.getElementById("error");
+      const button = event.currentTarget.querySelector("button[type=submit]");
       error.textContent = "";
-      const res = await fetch("/api/login", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          username: document.getElementById("username").value,
-          token: document.getElementById("token").value
-        })
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || data.ok === false) {
-        error.textContent = data.error || "Login failed.";
-        return;
+      button.disabled = true;
+      try {
+        const res = await fetch("/api/login", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            username: document.getElementById("username").value,
+            token: document.getElementById("token").value,
+            remember: document.getElementById("rememberLogin").checked
+          })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.ok === false) {
+          error.textContent = data.error || "Login failed.";
+          return;
+        }
+        window.location.href = "/";
+      } catch (_) {
+        error.textContent = "Couldn’t reach your studio. Check your connection and try again.";
+      } finally {
+        button.disabled = false;
       }
-      window.location.href = "/";
     });
   </script>
 </body>
@@ -9302,8 +9385,8 @@ PWA_MANIFEST = {
     "scope": "/",
     "display": "standalone",
     "display_override": ["window-controls-overlay", "standalone", "browser"],
-    "background_color": "#edf8f4",
-    "theme_color": "#16a394",
+    "background_color": "#f3f1e9",
+    "theme_color": "#f3f1e9",
     "orientation": "any",
     "categories": ["productivity", "writing", "utilities"],
     "icons": [
@@ -9338,7 +9421,7 @@ PWA_MANIFEST = {
 }
 
 
-SERVICE_WORKER = r"""const CACHE_NAME = "lazyblog-studio-v7";
+SERVICE_WORKER = r"""const CACHE_NAME = "lazyblog-studio-v8-atelier";
 const APP_SHELL = [
   "/manifest.webmanifest",
   "/icons/lazyblog.svg",
@@ -9463,6 +9546,9 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
             body = json.dumps({"ok": status.value < 400, **payload}, ensure_ascii=False).encode("utf-8")
             self.send_response(status.value)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            if status.value < 400 and not any(key.lower() == "set-cookie" for key in (headers or {})):
+                self.renew_login()
             for name, value in (headers or {}).items():
                 self.send_header(name, value)
             self.send_header("Content-Length", str(len(body)))
@@ -9472,12 +9558,21 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
         def send_html(self, body_text: str | None = None, status: HTTPStatus = HTTPStatus.OK) -> None:
             reply_profile = app.codex_profile("reply")
             html_text = body_text or INDEX_HTML.replace("__MODEL_LABEL__", f"{reply_profile['model']} / {reply_profile['reasoning']}")
+            html_text = html_text.replace("__STUDIO_THEME__", STUDIO_THEME_CSS)
             body = html_text.encode("utf-8")
             self.send_response(status.value)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            if status.value < 400:
+                self.renew_login()
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def renew_login(self) -> None:
+            cookie = renewed_studio_cookie(self.headers.get("Cookie", ""))
+            if cookie:
+                self.send_header("Set-Cookie", cookie)
 
         def send_login(self) -> None:
             self.send_html(LOGIN_HTML.replace("__USERNAME__", html.escape(studio_username(), quote=True)), HTTPStatus.UNAUTHORIZED)
@@ -9652,6 +9747,14 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
                 if not self.authorize_request(parsed.path):
                     return
                 if parsed.path == "/login":
+                    if verify_studio_cookie(self.headers.get("Cookie", "")):
+                        self.send_response(HTTPStatus.SEE_OTHER.value)
+                        self.send_header("Location", "/")
+                        self.send_header("Cache-Control", "no-store")
+                        self.send_header("Content-Length", "0")
+                        self.renew_login()
+                        self.end_headers()
+                        return
                     self.send_login()
                     return
                 if parsed.path == "/":
@@ -9812,7 +9915,8 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
                     username = str(payload.get("username", "")).strip()
                     token = str(payload.get("token", "")).strip()
                     if studio_auth_enabled() and username == studio_username() and hmac.compare_digest(token, studio_login_token()):
-                        cookie = f"{STUDIO_AUTH_COOKIE}={make_studio_cookie(username)}; {studio_cookie_attributes()}"
+                        remember = payload.get("remember", True) is True
+                        cookie = f"{STUDIO_AUTH_COOKIE}={make_studio_cookie(username, remember=remember)}; {studio_cookie_attributes(remember=remember)}"
                         self.send_json({"user": username}, headers={"Set-Cookie": cookie})
                         return
                     self.send_json({"error": "invalid LazyBlog Studio login"}, HTTPStatus.UNAUTHORIZED)
