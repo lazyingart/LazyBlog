@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="LazyBlog Studio">
+  <title>LazyBlog Studio — Atelier</title>
+  <!-- Full-bleed opaque background; the monogram fits inside the maskable safe circle. -->
+  <path fill="#b83e2c" d="M0 0h512v512H0z"/>
+  <g fill="#fff8e7">
+    <path d="M224 137h48l-34 192c-3 17-1 24 8 24 10 0 22-12 34-28l13 10c-19 29-39 44-62 44-29 0-42-19-36-51l28-162c2-12 0-17-15-18l2-11z"/>
+    <circle cx="330" cy="358" r="20"/>
+  </g>
+</svg>

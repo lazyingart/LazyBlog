@@ -26,9 +26,35 @@ SQLite message ledger retain their existing contracts.
   their existing IDs and API contracts.
 - A session-view revision prevents late history/autoload/background refresh
   responses from replacing a new or differently selected conversation.
-- The PWA shell cache is `lazyblog-studio-v8-atelier`. Root HTML, login, and API
+- The PWA shell cache is `lazyblog-studio-v9-atelier-icons`. Root HTML, login, and API
   responses remain outside the service-worker cache; auth responses additionally
   use `Cache-Control: no-store`.
+
+### App icons
+
+`web/icons/lazyblog.svg` is the canonical ivory-on-vermilion `l.` monogram.
+The opaque 192px and 512px PNGs are built from that vector, not drawn separately.
+The mark stays inside the central maskable safe circle; the operating system
+supplies its own rounded-square/circular mask. The server reads the committed
+PNGs and caches those bytes in memory, so it needs no imaging dependencies.
+
+Rebuild with `bash scripts/build_studio_icons.sh` (ImageMagick is needed only
+on the build machine). Commit all three assets with any source change.
+
+The manifest icons, shortcut icons, favicon, login page, and workspace reference
+the same `APP_ICON_VERSION` query value. Both HTML pages use a PNG
+`apple-touch-icon` rather than the formerly unsupported SVG reference. Existing
+proxy paths stay unchanged. The manifest URL, start URL, and app identity stay
+stable; the manifest is network-first with an offline cached fallback, and its
+HTTP response requires revalidation. The new service worker reloads its shell
+assets and removes previous cache versions.
+
+Deploy the `web/icons/` directory with the server. Verify the public manifest and
+each versioned icon URL against local bytes. Existing OS home-screen shortcuts
+may retain their previous artwork after the website has updated; icon assets
+being live is not proof that a particular phone has refreshed its shortcut.
+Do not clear site data to force an icon update: it may remove unsynced local
+drafts and login state.
 
 ## Persistent login
 

@@ -14,7 +14,6 @@ import os
 import re
 import shutil
 import sqlite3
-import struct
 import subprocess
 import sys
 import tempfile
@@ -23,9 +22,9 @@ import time
 import traceback
 import urllib.parse
 import uuid
-import zlib
 from collections import deque
 from datetime import datetime, timezone
+from functools import lru_cache
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -37,6 +36,8 @@ from lazyblog_translate import first_heading, load_env_file, split_front_matter
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
+APP_ICON_ROOT = ROOT_DIR / "web" / "icons"
+APP_ICON_VERSION = "atelier-2"
 CHAT_ROOT = ROOT_DIR / "content" / "chat"
 DRAFT_ROOT = ROOT_DIR / "content" / "drafts"
 JOB_ROOT = ROOT_DIR / "content" / "codex-jobs"
@@ -6131,8 +6132,8 @@ INDEX_HTML = r"""<!doctype html>
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-title" content="LazyBlog Studio">
   <link rel="manifest" href="/manifest.webmanifest">
-  <link rel="icon" href="/icons/lazyblog.svg" type="image/svg+xml">
-  <link rel="apple-touch-icon" href="/icons/lazyblog.svg">
+  <link rel="icon" href="/icons/lazyblog.svg?v=__ICON_VERSION__" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/icons/lazyblog-192.png?v=__ICON_VERSION__">
   <link rel="stylesheet" href="/assets/vendor/katex.css">
   <script src="/assets/vendor/marked.js"></script>
   <script src="/assets/vendor/dompurify.js"></script>
@@ -9316,7 +9317,10 @@ LOGIN_HTML = r"""<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#f3f1e9">
   <link rel="manifest" href="/manifest.webmanifest">
-  <link rel="icon" href="/icons/lazyblog.svg" type="image/svg+xml">
+  <link rel="icon" href="/icons/lazyblog.svg?v=__ICON_VERSION__" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/icons/lazyblog-192.png?v=__ICON_VERSION__">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="LazyBlog Studio">
   <title>LazyBlog Studio Login</title>
   <style>* { box-sizing: border-box; } __STUDIO_THEME__</style>
 </head>
@@ -9378,6 +9382,7 @@ LOGIN_HTML = r"""<!doctype html>
 
 
 PWA_MANIFEST = {
+    "id": "/",
     "name": "LazyBlog Studio",
     "short_name": "LazyBlog",
     "description": "Local chat-to-Markdown drafting and WordPress publishing for LazyBlog.",
@@ -9391,19 +9396,19 @@ PWA_MANIFEST = {
     "categories": ["productivity", "writing", "utilities"],
     "icons": [
         {
-            "src": "/icons/lazyblog-192.png",
+            "src": f"/icons/lazyblog-192.png?v={APP_ICON_VERSION}",
             "sizes": "192x192",
             "type": "image/png",
             "purpose": "any maskable",
         },
         {
-            "src": "/icons/lazyblog-512.png",
+            "src": f"/icons/lazyblog-512.png?v={APP_ICON_VERSION}",
             "sizes": "512x512",
             "type": "image/png",
             "purpose": "any maskable",
         },
         {
-            "src": "/icons/lazyblog.svg",
+            "src": f"/icons/lazyblog.svg?v={APP_ICON_VERSION}",
             "sizes": "any",
             "type": "image/svg+xml",
             "purpose": "any maskable",
@@ -9415,18 +9420,18 @@ PWA_MANIFEST = {
             "short_name": "Chat",
             "description": "Open LazyBlog Studio to capture a new note.",
             "url": "/",
-            "icons": [{"src": "/icons/lazyblog-192.png", "sizes": "192x192", "type": "image/png"}],
+            "icons": [{"src": f"/icons/lazyblog-192.png?v={APP_ICON_VERSION}", "sizes": "192x192", "type": "image/png"}],
         }
     ],
 }
 
 
-SERVICE_WORKER = r"""const CACHE_NAME = "lazyblog-studio-v8-atelier";
+SERVICE_WORKER = r"""const CACHE_NAME = "lazyblog-studio-v9-atelier-icons";
 const APP_SHELL = [
   "/manifest.webmanifest",
-  "/icons/lazyblog.svg",
-  "/icons/lazyblog-192.png",
-  "/icons/lazyblog-512.png",
+  "/icons/lazyblog.svg?v=__ICON_VERSION__",
+  "/icons/lazyblog-192.png?v=__ICON_VERSION__",
+  "/icons/lazyblog-512.png?v=__ICON_VERSION__",
   "/assets/vendor/marked.js",
   "/assets/vendor/dompurify.js",
   "/assets/vendor/katex.js",
@@ -9435,7 +9440,9 @@ const APP_SHELL = [
 ];
 
 self.addEventListener("install", (event) => {
-  event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL)));
+  event.waitUntil(caches.open(CACHE_NAME).then((cache) =>
+    cache.addAll(APP_SHELL.map((path) => new Request(path, { cache: "reload" })))
+  ));
   self.skipWaiting();
 });
 
@@ -9453,6 +9460,14 @@ self.addEventListener("fetch", (event) => {
   if (url.origin !== self.location.origin || url.pathname.startsWith("/api/")) return;
   if (url.pathname === "/" || url.pathname === "/login") return;
   if (event.request.method !== "GET") return;
+  if (url.pathname === "/manifest.webmanifest") {
+    // Installed apps must be able to discover newer icons, not a frozen manifest.
+    event.respondWith(fetch(event.request, { cache: "no-cache" }).catch(async () => {
+      const cached = await caches.match(event.request);
+      return cached || Response.error();
+    }));
+    return;
+  }
   event.respondWith(
     caches.match(event.request).then((cached) => {
       if (cached) return cached;
@@ -9464,68 +9479,18 @@ self.addEventListener("fetch", (event) => {
     })
   );
 });
-"""
+""".replace("__ICON_VERSION__", APP_ICON_VERSION)
 
 
-APP_ICON_SVG = r"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="LazyBlog Studio">
-  <defs>
-    <linearGradient id="bg" x1="64" y1="48" x2="448" y2="464" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#fff4d9"/>
-      <stop offset="0.52" stop-color="#d9ede8"/>
-      <stop offset="1" stop-color="#0f766e"/>
-    </linearGradient>
-    <linearGradient id="mark" x1="130" y1="150" x2="390" y2="390" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#d96b43"/>
-      <stop offset="1" stop-color="#e3a92f"/>
-    </linearGradient>
-  </defs>
-  <rect width="512" height="512" rx="118" fill="url(#bg)"/>
-  <path d="M145 140h161c44 0 76 28 76 66 0 26-13 46-36 57 29 10 47 34 47 66 0 42-34 73-82 73H145V140Z" fill="#1d2520"/>
-  <path d="M204 197v55h82c21 0 35-11 35-28s-14-27-35-27h-82Zm0 105v43h99c18 0 30-9 30-22s-12-21-30-21h-99Z" fill="#fffaf0"/>
-  <path d="M121 382c69-12 111-41 134-88 8 50 41 82 102 98-72 29-150 26-236-10Z" fill="url(#mark)" opacity="0.96"/>
-</svg>
-"""
+APP_ICON_SVG = (APP_ICON_ROOT / "lazyblog.svg").read_text(encoding="utf-8")
 
 
-def png_chunk(kind: bytes, data: bytes) -> bytes:
-    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
-
-
+@lru_cache(maxsize=2)
 def make_icon_png(size: int) -> bytes:
-    rows = []
-    for y in range(size):
-        row = bytearray([0])
-        for x in range(size):
-            nx = x / max(size - 1, 1)
-            ny = y / max(size - 1, 1)
-            r = int(255 * (1 - nx) + 15 * nx)
-            g = int(250 * (1 - ny) + 118 * ny)
-            b = int(240 * (1 - nx) + 110 * nx)
-            radius = size * 0.18
-            border = x < radius and y < radius and (x - radius) ** 2 + (y - radius) ** 2 > radius**2
-            border = border or x > size - radius and y < radius and (x - size + radius) ** 2 + (y - radius) ** 2 > radius**2
-            border = border or x < radius and y > size - radius and (x - radius) ** 2 + (y - size + radius) ** 2 > radius**2
-            border = border or x > size - radius and y > size - radius and (x - size + radius) ** 2 + (y - size + radius) ** 2 > radius**2
-            if border:
-                row.extend((0, 0, 0, 0))
-                continue
-            if size * 0.27 < x < size * 0.73 and size * 0.28 < y < size * 0.73:
-                r, g, b = 29, 37, 32
-            if size * 0.38 < x < size * 0.63 and size * 0.38 < y < size * 0.47:
-                r, g, b = 255, 250, 240
-            if size * 0.38 < x < size * 0.67 and size * 0.55 < y < size * 0.64:
-                r, g, b = 255, 250, 240
-            if y > size * 0.72 and abs((x / size) - 0.5) < 0.34 - ((y / size) - 0.72) * 0.8:
-                r, g, b = 217, 107, 67
-            row.extend((r, g, b, 255))
-        rows.append(bytes(row))
-    raw = b"".join(rows)
-    return (
-        b"\x89PNG\r\n\x1a\n"
-        + png_chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0))
-        + png_chunk(b"IDAT", zlib.compress(raw, 9))
-        + png_chunk(b"IEND", b"")
-    )
+    """Serve the exact SVG-derived build artifact; no imaging dependency at runtime."""
+    if size not in {192, 512}:
+        raise ValueError("unsupported Studio icon size")
+    return (APP_ICON_ROOT / f"lazyblog-{size}.png").read_bytes()
 
 
 def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
@@ -9559,6 +9524,7 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
             reply_profile = app.codex_profile("reply")
             html_text = body_text or INDEX_HTML.replace("__MODEL_LABEL__", f"{reply_profile['model']} / {reply_profile['reasoning']}")
             html_text = html_text.replace("__STUDIO_THEME__", STUDIO_THEME_CSS)
+            html_text = html_text.replace("__ICON_VERSION__", APP_ICON_VERSION)
             body = html_text.encode("utf-8")
             self.send_response(status.value)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -9581,7 +9547,7 @@ def make_handler(app: LazyBlogStudio) -> type[BaseHTTPRequestHandler]:
             body = body_text.encode("utf-8")
             self.send_response(HTTPStatus.OK.value)
             self.send_header("Content-Type", content_type)
-            self.send_header("Cache-Control", "no-cache" if content_type.startswith("application/javascript") else "public, max-age=3600")
+            self.send_header("Cache-Control", "no-cache" if content_type.startswith(("application/javascript", "application/manifest+json")) else "public, max-age=3600")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
